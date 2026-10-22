@@ -15,14 +15,15 @@ enum NetworkInfo {
             let interface = current.pointee
             guard let address = interface.ifa_addr else { continue }
             guard address.pointee.sa_family == UInt8(AF_INET) else { continue }
-            guard interface.ifa_name.pointee == "en0" || interface.ifa_name.pointee == "en1" else { continue }
+            let interfaceName = String(cString: interface.ifa_name)
+            guard interfaceName == "en0" || interfaceName == "en1" else { continue }
 
             var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
             let length = socklen_t(address.pointee.sa_len)
             guard getnameinfo(address, length, &hostname, socklen_t(NI_MAXHOST), nil, 0, NI_NUMERICHOST) == 0 else { continue }
             let value = String(cString: hostname)
             if value == "127.0.0.1" { continue }
-            if interface.ifa_name.pointee == "en0" { return value }
+            if interfaceName == "en0" { return value }
             if fallback == nil { fallback = value }
         }
         return fallback

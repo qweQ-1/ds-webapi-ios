@@ -7,9 +7,55 @@ import Foundation
 ///   GET  /health                健康检查
 ///   GET  /v1/models             模型列表
 ///   POST /v1/chat/completions   聊天补全（支持 stream）
+///
+/// 网页端一次只接受一条 prompt，历史靠 chat_session_id 串起来，
+/// 所以这里维护一个"会话登记表"，把 OpenAI 风格的 messages 数组映射成网页端会话。
 final class BridgeServer {
+
+    /// 一个网页端会话的状态
+    struct ConversationState {
+        var chatSessionID: String
+        var lastMessageID: String?
+        var fingerprint: String
+        var messageCount: Int
+    }
+
+    /// 会话登记表（线程安全）
+    final class ConversationStore {
+        private var states: [String: ConversationState] = [:]
+        private let lock = NSLock()
+
+        /// 取（必要时新建）一个会话
+        func state(for key: String, fingerprint: String, messageCount: Int) -> ConversationState {
+            lock.lock()
+            defer { lock.unlock() }
+            if var existing = states[key],
+               existing.fingerprint == fingerprint,
+               existing.messageCount < messageCount {
+                existing.messageCount = messageCount
+                states[key] = existing
+                return existing
+            }
+            let fresh = ConversationState(chatSessionID: UUID().uuidString.lowercased(),
+                                          lastMessageID: nil,
+                                          fingerprint: fingerprint,
+                                          messageCount: messageCount)
+            states[key] = fresh
+            return fresh
+        }
+
+        /// 记录这一轮返回的 message_id，下一轮用它当 parent_message_id
+        func updateMessage(id: String?, key: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard var state = states[key], let id = id, !id.isEmpty else { return }
+            state.lastMessageID = id
+            states[key] = state
+        }
+    }
+
     private var server: HttpServer?
-    private let queue = DispatchQueue(label: "com.qweq-1.dswebapi.bridge")
+    private let conversations = ConversationStore()
 
     private let settingsProvider: () -> AppSettings
     private let tokenProvider: () -> String
@@ -58,9 +104,8 @@ final class BridgeServer {
     // MARK: - 路由
 
     private func handle(_ request: HTTPRequest, _ writer: HTTPResponseWriter) {
-        let path = request.path.hasSuffix("/") && request.path.count > 1
-            ? String(request.path.dropLast())
-            : request.path
+        var path = request.path
+        if path.count > 1 && path.hasSuffix("/") { path = String(path.dropLast()) }
 
         if request.method == .options {
             writer.sendHead(status: 204, contentType: "text/plain")
@@ -108,7 +153,6 @@ final class BridgeServer {
             provided = String(provided.dropFirst(7))
         }
         if provided == expected { return true }
-        // 浏览器端也支持 ?key=xxx
         if let queryKey = request.query["key"], queryKey == expected { return true }
         return false
     }
@@ -126,12 +170,13 @@ final class BridgeServer {
         let body: [String: Any] = [
             "status": "ok",
             "service": "DeepSeek Web → OpenAI API",
-            "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0",
+            "version": (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.0.0",
             "has_token": !tokenProvider().isEmpty,
             "has_cookie": !cookieProvider().isEmpty,
             "model": settings.model,
             "thinking_enabled": settings.thinkingEnabled,
-            "search_enabled": settings.searchEnabled
+            "search_enabled": settings.searchEnabled,
+            "upstream": settings.baseURL
         ]
         writer.sendHead(status: 200)
         writer.write(OpenAIEnvelope.json(body))
@@ -167,6 +212,8 @@ final class BridgeServer {
         writer.close()
     }
 
+    // MARK: - 聊天补全
+
     private func handleChat(_ request: HTTPRequest, _ writer: HTTPResponseWriter) {
         let payload = request.jsonBody
         if payload.isEmpty {
@@ -176,7 +223,6 @@ final class BridgeServer {
             return
         }
 
-        let settings = settingsProvider()
         var messages = Self.parseMessages(payload["messages"])
         if messages.isEmpty {
             writer.sendHead(status: 400)
@@ -184,128 +230,186 @@ final class BridgeServer {
             writer.close()
             return
         }
+
+        let settings = settingsProvider()
+
+        // 网页端没有 system 角色，把系统提示词拼到第一条用户消息前面
         let systemPrompt = settings.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !systemPrompt.isEmpty && !messages.contains(where: { $0.role == "system" }) {
-            messages.insert(.init(role: "system", content: systemPrompt), at: 0)
+        if !systemPrompt.isEmpty, messages.first?.role == "user" {
+            messages[0].content = systemPrompt + "\n\n" + messages[0].content
+        }
+
+        // 网页端一次只发一条：取最后一条用户消息
+        guard let prompt = messages.last(where: { $0.role == "user" })?.content ?? messages.last?.content else {
+            writer.sendHead(status: 400)
+            writer.write(OpenAIEnvelope.error("没有可发送的内容", code: "invalid_request"))
+            writer.close()
+            return
         }
 
         let requestedModel = (payload["model"] as? String) ?? settings.model
         var options = DeepSeekWebClient.Options()
-        options.model = requestedModel.isEmpty ? "deepseek-chat" : requestedModel
+        options.modelType = requestedModel.isEmpty ? "deepseek-chat" : requestedModel
         options.thinkingEnabled = settings.thinkingEnabled || requestedModel.contains("reasoner")
         options.searchEnabled = settings.searchEnabled
         options.temperature = (payload["temperature"] as? Double) ?? settings.temperature
         options.maxTokens = (payload["max_tokens"] as? Int) ?? settings.maxTokens
 
         let wantsStream = (payload["stream"] as? Bool) ?? true
-        logger(.info, "收到请求 model=\(options.model) stream=\(wantsStream) messages=\(messages.count)")
+        let fingerprint = messages.first?.content ?? ""
+        let conversationKey = (payload["conversation_id"] as? String) ?? ("auto:" + String(fingerprint.hashValue))
 
+        logger(.info, "收到请求 model=\(options.modelType) stream=\(wantsStream) messages=\(messages.count)")
+
+        Task { [weak self] in
+            guard let self = self else { return }
+            await self.runCompletion(prompt: prompt,
+                                     options: options,
+                                     wantsStream: wantsStream,
+                                     conversationKey: conversationKey,
+                                     fingerprint: fingerprint,
+                                     messageCount: messages.count,
+                                     writer: writer)
+        }
+    }
+
+    private func runCompletion(prompt: String,
+                               options: DeepSeekWebClient.Options,
+                               wantsStream: Bool,
+                               conversationKey: String,
+                               fingerprint: String,
+                               messageCount: Int,
+                               writer: HTTPResponseWriter) async {
         let client = makeClient()
-        let envelope = OpenAIEnvelope(model: options.model)
+        let guest = !client.isLoggedIn
+        let envelope = OpenAIEnvelope(model: options.modelType)
 
-        if wantsStream {
-            streamResponse(client: client,
-                           messages: messages,
-                           options: options,
-                           envelope: envelope,
-                           writer: writer)
-        } else {
-            blockingResponse(client: client,
-                             messages: messages,
-                             options: options,
-                             envelope: envelope,
-                             writer: writer)
-        }
-    }
+        do {
+            // 1) 取工作量证明题目并解出来
+            let challenge = try await client.fetchChallenge(guest: guest)
+            let answer = try challenge.solve()
+            let powHeader = client.powHeaderValue(challenge: challenge, answer: answer, guest: guest)
+            logger(.info, "PoW 已完成（answer=\(answer)，guest=\(guest)）")
 
-    private func streamResponse(client: DeepSeekWebClient,
-                                messages: [DeepSeekWebClient.UpstreamMessage],
-                                options: DeepSeekWebClient.Options,
-                                envelope: OpenAIEnvelope,
-                                writer: HTTPResponseWriter) {
-        writer.sendHead(status: 200, contentType: "text/event-stream; charset=utf-8")
+            // 2) 拿到（或新建）网页端会话
+            let state = conversations.state(for: conversationKey,
+                                           fingerprint: fingerprint,
+                                           messageCount: messageCount)
 
-        Task { [weak self] in
-            var isFirst = true
-            var finishReason = "stop"
-            var fullText = ""
+            let upstreamRequest = try client.makeCompletionRequest(prompt: prompt,
+                                                                    options: options,
+                                                                    chatSessionID: state.chatSessionID,
+                                                                    parentMessageID: state.lastMessageID,
+                                                                    powHeader: powHeader)
 
-            do {
-                let upstream = client.stream(messages: messages, options: options)
-                for try await event in upstream {
-                    if let self = self, self.settingsProvider().showRawStream {
-                        self.logger(.info, "上游事件：\(event.event ?? "-") \(event.data)")
-                    }
-                    for delta in UpstreamEventParser.interpret(event) {
-                        switch delta {
-                        case let .content(text):
-                            fullText += text
-                            var payload: [String: Any] = ["content": text]
-                            if isFirst {
-                                payload["role"] = "assistant"
-                                isFirst = false
-                            }
-                            writer.write("data: \(envelope.chunk(delta: payload, finishReason: nil))\n\n")
-                        case let .thinking(text):
-                            writer.write("data: \(envelope.chunk(delta: ["reasoning_content": text], finishReason: nil))\n\n")
-                        case let .finish(reason):
-                            finishReason = reason ?? "stop"
-                        case let .failure(message):
-                            writer.write("data: \(OpenAIEnvelope.error(message))\n\n")
-                        case let .unknown(raw):
-                            if let self = self, self.settingsProvider().showRawStream {
-                                self.logger(.info, "未识别负载：\(raw)")
-                            }
-                        }
-                    }
-                }
-            } catch {
-                writer.write("data: \(OpenAIEnvelope.error(error.localizedDescription))\n\n")
+            if wantsStream {
+                await streamUpstream(request: upstreamRequest,
+                                     envelope: envelope,
+                                     conversationKey: conversationKey,
+                                     writer: writer)
+            } else {
+                await blockingUpstream(request: upstreamRequest,
+                                       envelope: envelope,
+                                       conversationKey: conversationKey,
+                                       writer: writer)
             }
-
-            writer.write("data: \(envelope.chunk(delta: [:], finishReason: finishReason))\n\n")
-            writer.write("data: [DONE]\n\n")
-            writer.close()
-            logger(.ok, "本次回复完成，共 \(fullText.count) 字")
-        }
-    }
-
-    private func blockingResponse(client: DeepSeekWebClient,
-                                  messages: [DeepSeekWebClient.UpstreamMessage],
-                                  options: DeepSeekWebClient.Options,
-                                  envelope: OpenAIEnvelope,
-                                  writer: HTTPResponseWriter) {
-        Task { [weak self] in
-            do {
-                var text = ""
-                var thinking = ""
-                do {
-                    text = try await client.complete(messages: messages, options: options)
-                } catch {
-                    // 上游可能只支持流式，退回流式聚合
-                    let upstream = client.stream(messages: messages, options: options)
-                    for try await event in upstream {
-                        for delta in UpstreamEventParser.interpret(event) {
-                            switch delta {
-                            case let .content(chunk): text += chunk
-                            case let .thinking(chunk): thinking += chunk
-                            default: break
-                            }
-                        }
-                    }
-                }
-                writer.sendHead(status: 200)
-                writer.write(envelope.completion(content: text, thinking: thinking, finishReason: "stop"))
-                writer.close()
-            } catch {
+        } catch {
+            logger(.error, "上游失败：\(error.localizedDescription)")
+            if wantsStream {
+                writer.write("data: \(OpenAIEnvelope.error(error.localizedDescription, code: "upstream_error"))\n\n")
+                writer.write("data: [DONE]\n\n")
+            } else {
                 writer.sendHead(status: 502)
                 writer.write(OpenAIEnvelope.error(error.localizedDescription, code: "upstream_error"))
-                writer.close()
             }
-            if let self = self {
-                self.logger(.ok, "非流式请求完成")
-            }
+            writer.close()
         }
+    }
+
+    private func streamUpstream(request: URLRequest,
+                                envelope: OpenAIEnvelope,
+                                conversationKey: String,
+                                writer: HTTPResponseWriter) async {
+        writer.sendHead(status: 200, contentType: "text/event-stream; charset=utf-8")
+
+        var isFirst = true
+        var finishReason = "stop"
+        var fullText = ""
+        var thinkingText = ""
+
+        do {
+            let client = makeClient()
+            for try await event in client.stream(request: request) {
+                if settingsProvider().showRawStream {
+                    logger(.info, "上游事件 [\(event.event ?? "-")] \(event.data)")
+                }
+                if let messageID = Self.messageID(in: event) {
+                    conversations.updateMessage(id: messageID, key: conversationKey)
+                }
+                for delta in UpstreamEventParser.interpret(event) {
+                    switch delta {
+                    case let .content(text):
+                        fullText += text
+                        var payload: [String: Any] = ["content": text]
+                        if isFirst {
+                            payload["role"] = "assistant"
+                            isFirst = false
+                        }
+                        writer.write("data: \(envelope.chunk(delta: payload, finishReason: nil))\n\n")
+                    case let .thinking(text):
+                        thinkingText += text
+                        writer.write("data: \(envelope.chunk(delta: ["reasoning_content": text], finishReason: nil))\n\n")
+                    case let .finish(reason):
+                        finishReason = reason ?? "stop"
+                    case let .failure(message):
+                        writer.write("data: \(OpenAIEnvelope.error(message))\n\n")
+                    case let .unknown(raw):
+                        if settingsProvider().showRawStream {
+                            logger(.info, "未识别负载：\(raw)")
+                        }
+                    }
+                }
+            }
+        } catch {
+            writer.write("data: \(OpenAIEnvelope.error(error.localizedDescription, code: "upstream_error"))\n\n")
+        }
+
+        writer.write("data: \(envelope.chunk(delta: [:], finishReason: finishReason))\n\n")
+        writer.write("data: [DONE]\n\n")
+        writer.close()
+        logger(.ok, "本次回复完成，正文 \(fullText.count) 字，思考 \(thinkingText.count) 字")
+    }
+
+    private func blockingUpstream(request: URLRequest,
+                                  envelope: OpenAIEnvelope,
+                                  conversationKey: String,
+                                  writer: HTTPResponseWriter) async {
+        var content = ""
+        var thinking = ""
+        var finishReason = "stop"
+        do {
+            let client = makeClient()
+            for try await event in client.stream(request: request) {
+                if let messageID = Self.messageID(in: event) {
+                    conversations.updateMessage(id: messageID, key: conversationKey)
+                }
+                for delta in UpstreamEventParser.interpret(event) {
+                    switch delta {
+                    case let .content(text): content += text
+                    case let .thinking(text): thinking += text
+                    case let .finish(reason): finishReason = reason ?? "stop"
+                    default: break
+                    }
+                }
+            }
+            writer.sendHead(status: 200)
+            writer.write(envelope.completion(content: content, thinking: thinking, finishReason: finishReason))
+        } catch {
+            writer.sendHead(status: 502)
+            writer.write(OpenAIEnvelope.error(error.localizedDescription, code: "upstream_error"))
+        }
+        writer.close()
+        logger(.ok, "非流式请求完成，正文 \(content.count) 字")
     }
 
     // MARK: - 工具
@@ -317,8 +421,38 @@ final class BridgeServer {
             accessToken: tokenProvider(),
             sessionCookie: cookieProvider(),
             deviceID: AppSettings.deviceID,
-            clientVersion: settings.clientVersion
+            deviceModel: settings.deviceModel,
+            clientVersion: settings.clientVersion,
+            clientLocale: settings.clientLocale,
+            clientPlatform: settings.clientPlatform,
+            clientBundleID: settings.clientBundleID,
+            timezoneOffsetSeconds: settings.timezoneOffsetSeconds
         )
+    }
+
+    /// 从 SSE 事件里抠出 message_id（下一轮当 parent_message_id 用）
+    static func messageID(in event: SSEEvent) -> String? {
+        guard let data = event.data.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+            return nil
+        }
+        return findMessageID(in: json)
+    }
+
+    private static func findMessageID(in json: Any) -> String? {
+        if let dict = json as? [String: Any] {
+            if let value = dict["message_id"] as? String, !value.isEmpty { return value }
+            for key in ["biz_data", "data", "message"] {
+                if let nested = dict[key] {
+                    if let found = findMessageID(in: nested) { return found }
+                }
+            }
+        } else if let array = json as? [Any] {
+            for item in array {
+                if let found = findMessageID(in: item) { return found }
+            }
+        }
+        return nil
     }
 
     static func parseMessages(_ raw: Any?) -> [DeepSeekWebClient.UpstreamMessage] {

@@ -1,122 +1,221 @@
 import Foundation
-
-enum UpstreamError: LocalizedError {
-    case missingCredential
-    case http(status: Int, body: String)
-    case badResponse(String)
-    case upstream(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .missingCredential:
-            return "还没有 DeepSeek 网页端登录凭证，请先在设置里登录或粘贴 access token"
-        case let .http(status, body):
-            let preview = String(body.prefix(400))
-            return "DeepSeek 返回 HTTP \(status)：\(preview.isEmpty ? "空响应" : preview)"
-        case let .badResponse(text):
-            return "无法解析 DeepSeek 响应：\(String(text.prefix(300)))"
-        case let .upstream(text):
-            return text
-        }
-    }
-}
+import CryptoKit
 
 /// DeepSeek 网页端（chat.deepseek.com）内部接口的客户端。
 ///
-/// 网页端接口没有公开文档，所以：
-/// - 请求头按抓包结果补齐（x-client-* / x-device-*）；
-/// - 响应解析放在 UpstreamEventParser 里做容错。
+/// 协议要点（2026-10 从官方前端 bundle 里逆向确认）：
+/// - 聊天接口：`POST /api/v0/chat/completion`（**单数** completion），SSE 流式返回
+/// - 每次请求都要带 **工作量证明头**：`X-DS-PoW-Response: base64(JSON)`
+/// - PoW 题目来自 `POST /api/v0/chat/create_pow_challenge`（未登录用
+///   `POST /api/v0/users/create_guest_challenge`）
+/// - PoW 算法 `DeepSeekHashV1`：找最小 n，使得
+///   `SHA3-256("<challenge>_<difficulty>_" + String(n))` 的 hex 等于 challenge
+/// - 登录态 token 放在网页 localStorage 的 `userToken` 里，请求带 `Authorization: Bearer <token>`
+/// - 一次只发一条 prompt，历史由 `chat_session_id` + `parent_message_id` 在服务端串起来
 struct DeepSeekWebClient {
+
     struct UpstreamMessage {
         var role: String
         var content: String
     }
 
     struct Options {
-        var model: String = "deepseek-chat"
+        var modelType: String = "deepseek-chat"
         var thinkingEnabled: Bool = false
         var searchEnabled: Bool = false
         var temperature: Double = 0.7
         var maxTokens: Int = 4096
     }
 
+    /// 工作量证明题目
+    struct Challenge {
+        var algorithm: String = "DeepSeekHashV1"
+        var challenge: String = ""
+        var salt: Int = 0
+        var difficulty: Int = 0
+        var signature: String = ""
+        var expireAt: Double?
+
+        /// 解题：找最小 n，使 SHA3-256(prefix + n) == challenge
+        func solve(maxIterations: Int = 20_000_000) throws -> Int {
+            guard algorithm == "DeepSeekHashV1" else {
+                throw UpstreamError.powFailed("不支持的算法：\(algorithm)")
+            }
+            guard !challenge.isEmpty else {
+                throw UpstreamError.powFailed("挑战内容为空")
+            }
+            let prefix = Data("\(challenge)_\(difficulty)_".utf8)
+            let limit = min(max(salt, 1), maxIterations)
+            for index in 0..<limit {
+                var hasher = SHA3_256()
+                hasher.update(data: prefix)
+                hasher.update(data: Data(String(index).utf8))
+                let digest = hasher.finalize()
+                let hex = digest.map { String(format: "%02x", $0) }.joined()
+                if hex == challenge { return index }
+            }
+            throw UpstreamError.powFailed("工作量证明没算出来（尝试 \(limit) 次）")
+        }
+    }
+
     var baseURL: URL
     var accessToken: String
     var sessionCookie: String
     var deviceID: String
+    var deviceModel: String
     var clientVersion: String
+    var clientLocale: String = "zh-CN"
+    var clientPlatform: String = "web"
+    var clientBundleID: String = "com.deepseek.chat"
+    var timezoneOffsetSeconds: Int = 8 * 3600
+
+    static let chatPath = "/api/v0/chat/completion"
+    static let challengePath = "/api/v0/chat/create_pow_challenge"
+    static let guestChallengePath = "/api/v0/users/create_guest_challenge"
 
     static let defaultUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
-    /// 上游对话接口路径
-    static let chatPath = "/api/v0/chat/completions"
-
-    var hasCredential: Bool {
+    var isLoggedIn: Bool {
         !accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !sessionCookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    func makeRequest(messages: [UpstreamMessage], options: Options, stream: Bool) throws -> URLRequest {
-        guard hasCredential else { throw UpstreamError.missingCredential }
-        guard let url = URL(string: baseURL.absoluteString + Self.chatPath) else {
-            throw UpstreamError.badResponse("上游地址无效：\(baseURL.absoluteString)")
-        }
+    // MARK: - 请求头
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 120
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(stream ? "text/event-stream" : "application/json", forHTTPHeaderField: "Accept")
+    private func applyClientHeaders(_ request: inout URLRequest) {
         request.setValue(Self.defaultUserAgent, forHTTPHeaderField: "User-Agent")
-        request.setValue("zh_CN", forHTTPHeaderField: "x-client-locale")
+        request.setValue(clientLocale, forHTTPHeaderField: "x-client-locale")
         request.setValue(clientVersion, forHTTPHeaderField: "x-client-version")
-        request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "x-client-timezone")
+        request.setValue(String(timezoneOffsetSeconds), forHTTPHeaderField: "x-client-timezone-offset")
+        request.setValue(clientPlatform, forHTTPHeaderField: "x-client-platform")
+        request.setValue(clientBundleID, forHTTPHeaderField: "x-client-bundle-id")
         request.setValue(deviceID, forHTTPHeaderField: "x-device-id")
-        request.setValue("iOS", forHTTPHeaderField: "x-device-os")
-        request.setValue("iPhone", forHTTPHeaderField: "x-device-platform")
-        request.setValue("iPhone", forHTTPHeaderField: "x-device-type")
-        request.setValue("0", forHTTPHeaderField: "x-parent-app-id")
-
-        let token = accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !token.isEmpty {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        request.setValue(deviceModel, forHTTPHeaderField: "x-device-model")
         let cookie = sessionCookie.trimmingCharacters(in: .whitespacesAndNewlines)
         if !cookie.isEmpty {
             request.setValue(cookie, forHTTPHeaderField: "Cookie")
         }
+    }
 
-        var payload: [String: Any] = [
-            "model": options.model,
-            "messages": messages.map { ["role": $0.role, "content": $0.content] },
-            "stream": stream,
+    private func makeURL(_ path: String) throws -> URL {
+        var text = baseURL.absoluteString
+        while text.hasSuffix("/") { text.removeLast() }
+        guard let url = URL(string: text + path) else {
+            throw UpstreamError.badResponse("上游地址无效：\(baseURL.absoluteString)")
+        }
+        return url
+    }
+
+    // MARK: - 工作量证明
+
+    /// 取一道 PoW 题目
+    func fetchChallenge(guest: Bool) async throws -> Challenge {
+        let path = guest ? Self.guestChallengePath : Self.challengePath
+        var request = URLRequest(url: try makeURL(path))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyClientHeaders(&request)
+        if !guest, isLoggedIn {
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["target_path": Self.chatPath], options: [])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+            throw UpstreamError.http(status: http.statusCode, body: String(decoding: data, as: UTF8.self))
+        }
+        let json = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        if let message = Self.errorMessage(in: json) {
+            throw UpstreamError.challengeFailed(message)
+        }
+        guard let dict = Self.findChallenge(in: json) else {
+            throw UpstreamError.challengeFailed("没拿到 PoW 题目：" + String(String(decoding: data, as: UTF8.self).prefix(200)))
+        }
+        var challenge = Challenge()
+        challenge.algorithm = (dict["algorithm"] as? String) ?? "DeepSeekHashV1"
+        challenge.challenge = (dict["challenge"] as? String) ?? ""
+        challenge.salt = Self.intValue(dict["salt"]) ?? 0
+        challenge.difficulty = Self.intValue(dict["difficulty"]) ?? 0
+        challenge.signature = (dict["signature"] as? String) ?? ""
+        challenge.expireAt = Self.doubleValue(dict["expire_at"])
+        return challenge
+    }
+
+    /// 组装 `X-DS-PoW-Response`（已登录）/ `X-DS-Guest-PoW-Response`（访客）
+    func powHeaderValue(challenge: Challenge, answer: Int, guest: Bool) -> String {
+        var payload: [String: Any]
+        if guest {
+            payload = ["salt": challenge.salt, "answer": answer]
+        } else {
+            payload = [
+                "algorithm": challenge.algorithm,
+                "challenge": challenge.challenge,
+                "salt": challenge.salt,
+                "answer": answer,
+                "signature": challenge.signature,
+                "target_path": Self.chatPath
+            ]
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
+            return ""
+        }
+        return data.base64EncodedString()
+    }
+
+    // MARK: - 聊天
+
+    /// 构造一次聊天请求
+    func makeCompletionRequest(prompt: String,
+                                options: Options,
+                                chatSessionID: String,
+                                parentMessageID: String?,
+                                powHeader: String) throws -> URLRequest {
+        var request = URLRequest(url: try makeURL(Self.chatPath))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 180
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        applyClientHeaders(&request)
+        if isLoggedIn {
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        }
+        if !powHeader.isEmpty {
+            request.setValue(powHeader, forHTTPHeaderField: "X-DS-PoW-Response")
+        }
+
+        var body: [String: Any] = [
+            "chat_session_id": chatSessionID,
+            "model_type": options.modelType,
+            "prompt": prompt,
+            "ref_file_ids": [Any](),
             "thinking_enabled": options.thinkingEnabled,
             "search_enabled": options.searchEnabled,
-            "temperature": options.temperature,
-            "max_tokens": options.maxTokens,
-            "id": UUID().uuidString.lowercased(),
-            "conversation_id": UUID().uuidString.lowercased()
+            "action": NSNull(),
+            "preempt": NSNull()
         ]
-        if options.thinkingEnabled {
-            payload["thinking_type"] = "enabled"
-        }
-        request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
+        body["parent_message_id"] = parentMessageID ?? NSNull()
+        body["source"] = NSNull()
+        request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
 
         return request
     }
 
     /// 流式请求：把上游 SSE 事件逐个吐出来
-    func stream(messages: [UpstreamMessage], options: Options) -> AsyncThrowingStream<SSEEvent, Error> {
+    func stream(request: URLRequest) -> AsyncThrowingStream<SSEEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let request = try makeRequest(messages: messages, options: options, stream: true)
                     let (bytes, response) = try await URLSession.shared.bytes(for: request)
 
                     if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
                         var payload = Data()
                         for try await byte in bytes { payload.append(byte) }
-                        throw UpstreamError.http(status: http.statusCode, body: String(decoding: payload, as: UTF8.self))
+                        let text = String(decoding: payload, as: UTF8.self)
+                        if let message = Self.errorMessage(in: Data(text.utf8)) {
+                            throw UpstreamError.upstream(message)
+                        }
+                        throw UpstreamError.http(status: http.statusCode, body: text)
                     }
 
                     var parser = SSEParser()
@@ -138,27 +237,90 @@ struct DeepSeekWebClient {
         }
     }
 
-    /// 非流式请求
-    func complete(messages: [UpstreamMessage], options: Options) async throws -> String {
-        let request = try makeRequest(messages: messages, options: options, stream: false)
-        let (data, response) = try await URLSession.shared.data(for: request)
+    // MARK: - 解析工具
 
-        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-            throw UpstreamError.http(status: http.statusCode, body: String(decoding: data, as: UTF8.self))
+    /// 在任意 JSON 里找到带 salt/challenge 的那层字典
+    static func findChallenge(in json: Any) -> [String: Any]? {
+        if let dict = json as? [String: Any] {
+            if dict["salt"] != nil, dict["challenge"] != nil || dict["difficulty"] != nil {
+                return dict
+            }
+            for (_, value) in dict {
+                if let found = findChallenge(in: value) { return found }
+            }
+        } else if let array = json as? [Any] {
+            for value in array {
+                if let found = findChallenge(in: value) { return found }
+            }
         }
+        return nil
+    }
 
-        let text = String(decoding: data, as: UTF8.self)
-        guard let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
-            throw UpstreamError.badResponse(text)
+    /// 提取 DeepSeek 的错误码文案
+    static func errorMessage(in json: Any) -> String? {
+        if let dict = json as? [String: Any] {
+            if let error = dict["error"] as? [String: Any], let message = error["message"] as? String {
+                return message
+            }
+            if let message = dict["error"] as? String { return message }
+            if let message = dict["message"] as? String, dict["code"] != nil { return message }
+            if let data = dict["data"] as? [String: Any] {
+                if let message = errorMessage(in: data) { return message }
+            }
+            if let bizData = dict["biz_data"] as? [String: Any] {
+                if let message = errorMessage(in: bizData) { return message }
+            }
         }
-        let deltas = UpstreamEventParser.interpret(json: object)
-        let content = deltas.compactMap { delta -> String? in
-            if case let .content(text) = delta { return text }
+        return nil
+    }
+
+    static func errorMessage(in data: Data) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
             return nil
-        }.joined()
-        if content.isEmpty {
-            throw UpstreamError.badResponse(text)
         }
-        return content
+        return errorMessage(in: json)
+    }
+
+    static func intValue(_ any: Any?) -> Int? {
+        if let number = any as? Int { return number }
+        if let number = any as? Double { return Int(number) }
+        if let number = any as? NSNumber { return number.intValue }
+        if let text = any as? String { return Int(text) }
+        return nil
+    }
+
+    static func doubleValue(_ any: Any?) -> Double? {
+        if let number = any as? Double { return number }
+        if let number = any as? Int { return Double(number) }
+        if let number = any as? NSNumber { return number.doubleValue }
+        if let text = any as? String { return Double(text) }
+        return nil
+    }
+}
+
+enum UpstreamError: LocalizedError {
+    case missingCredential
+    case http(status: Int, body: String)
+    case badResponse(String)
+    case upstream(String)
+    case powFailed(String)
+    case challengeFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingCredential:
+            return "还没有 DeepSeek 网页端登录凭证，请在设置里登录或粘贴 access token"
+        case let .http(status, body):
+            let preview = String(body.prefix(300))
+            return "DeepSeek 返回 HTTP \(status)：\(preview.isEmpty ? "空响应" : preview)"
+        case let .badResponse(text):
+            return "无法解析 DeepSeek 响应：\(String(text.prefix(300)))"
+        case let .upstream(text):
+            return text
+        case let .powFailed(text):
+            return "工作量证明失败：\(text)"
+        case let .challengeFailed(text):
+            return "拿不到 PoW 题目：\(text)"
+        }
     }
 }

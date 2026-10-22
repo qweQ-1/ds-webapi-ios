@@ -25,6 +25,16 @@ struct AppSettings: Codable, Equatable {
     var showRawStream: Bool = false
     /// 上游客户端版本头
     var clientVersion: String = "20250101.99999"
+    /// 设备型号（网页端要求带 x-device-model）
+    var deviceModel: String = "iPhone"
+    /// 客户端平台
+    var clientPlatform: String = "web"
+    /// 客户端 bundle id（网页端自己用的是 com.deepseek.chat）
+    var clientBundleID: String = "com.deepseek.chat"
+    /// 语言
+    var clientLocale: String = "zh-CN"
+    /// 时区偏移秒数
+    var timezoneOffsetSeconds: Int = 28800
 
     private static let storageKey = "dswebapi.settings"
 

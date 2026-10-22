@@ -16,9 +16,9 @@ enum UpstreamDelta: Equatable {
 
 /// 把上游各种可能的 SSE 负载统一翻译成 UpstreamDelta。
 ///
-/// DeepSeek 网页端协议不是公开文档，而且改过几次，所以这里写得尽量"宽容"：
+/// 网页端协议不是公开文档，而且改过几次，所以这里写得尽量"宽容"：
 /// 同时兼容 OpenAI 风格（choices[].delta.content）、自研风格（顶层 content / text）
-/// 以及思考内容字段（thinking_content / reasoning_content）。
+/// 以及思考内容字段（thinking_content / reasoning_content / is_think）。
 enum UpstreamEventParser {
 
     /// 解析一个 SSE 事件，可能产出多条增量
@@ -28,11 +28,20 @@ enum UpstreamEventParser {
 
         if raw == "[DONE]" { return [.finish("stop")] }
 
-        if let name = event.event?.lowercased() {
-            if name == "error" { return [.failure(raw)] }
-            if name == "finish" || name == "done" || name == "end" { return [.finish("stop")] }
-            if name == "keepalive" || name == "ping" { return [] }
+        let name = event.event?.lowercased() ?? ""
+        if name == "error" { return [.failure(raw)] }
+        if name == "finish" { return [.finish("stop")] }
+        if name == "close" {
+            // close 事件带 close_reason
+            if let json = try? JSONSerialization.jsonObject(with: Data(raw.utf8), options: [.fragmentsAllowed]),
+               let dict = json as? [String: Any],
+               let reason = dict["close_reason"] as? String {
+                return [.finish(reason == "success" ? "stop" : reason)]
+            }
+            return [.finish("stop")]
         }
+        if name == "ready" || name == "toast" || name == "title" || name == "hint" { return [] }
+        if name == "updateSession" || name == "updateParentMessage" || name == "updateFile" { return [] }
 
         guard let json = try? JSONSerialization.jsonObject(with: Data(raw.utf8), options: [.fragmentsAllowed]) else {
             // 不是 JSON，当成纯文本增量
@@ -68,6 +77,12 @@ enum UpstreamEventParser {
             deltas.append(.failure(message))
             return deltas
         }
+        // DeepSeek 业务错误码：40003 登录失效、40301 PoW 不对、40029 IP 被限
+        if let code = DeepSeekWebClient.intValue(dict["code"]), code != 0, code != 200 {
+            let message = (dict["message"] as? String) ?? (dict["biz_msg"] as? String) ?? "DeepSeek 返回错误码 \(code)"
+            deltas.append(.failure(message))
+            return deltas
+        }
 
         // OpenAI 风格
         if let choices = dict["choices"] as? [[String: Any]] {
@@ -91,22 +106,43 @@ enum UpstreamEventParser {
             return deltas
         }
 
-        // 自研风格：顶层字段
-        if let thinking = thinkingText(dict) { deltas.append(.thinking(thinking)) }
-
-        if let content = dict["content"] as? String {
-            if !content.isEmpty { deltas.append(.content(content)) }
-        } else if let content = dict["text"] as? String {
-            if !content.isEmpty { deltas.append(.content(content)) }
-        } else if let content = dict["delta"] as? String {
-            if !content.isEmpty { deltas.append(.content(content)) }
-        } else if let content = dict["answer"] as? String {
-            if !content.isEmpty { deltas.append(.content(content)) }
+        // 网页端常见包装：biz_data / data
+        if let wrapped = dict["biz_data"] as? [String: Any] {
+            deltas.append(contentsOf: interpret(dict: wrapped))
+        }
+        if let wrapped = dict["data"] as? [String: Any] {
+            deltas.append(contentsOf: interpret(dict: wrapped))
         }
 
-        // 网页端有时把正文放在 choices 之外的对象里
-        if let response = dict["response"] as? [String: Any] {
-            deltas.append(contentsOf: interpret(dict: response))
+        // 思考内容
+        if let thinking = thinkingText(dict) { deltas.append(.thinking(thinking)) }
+
+        // 正文
+        var contentText: String?
+        for key in ["content", "text", "delta", "answer", "chunk"] {
+            if let value = dict[key] as? String, !value.isEmpty {
+                contentText = value
+                break
+            }
+        }
+        // 分片数组
+        if let fragments = dict["fragments"] as? [[String: Any]] {
+            for fragment in fragments {
+                if let thinking = thinkingText(fragment) {
+                    deltas.append(.thinking(thinking))
+                }
+                if let text = fragment["content"] as? String, !text.isEmpty {
+                    deltas.append(.content(text))
+                }
+            }
+        }
+        if let text = contentText, !text.isEmpty {
+            // is_think 表示这段是思考过程
+            if let isThink = dict["is_think"] as? Bool, isThink {
+                deltas.append(.thinking(text))
+            } else {
+                deltas.append(.content(text))
+            }
         }
 
         if let reason = dict["finish_reason"] as? String {

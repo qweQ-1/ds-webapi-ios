@@ -121,7 +121,7 @@ struct SettingsView: View {
                     Text("DeepSeek Web → OpenAI API\n把 DeepSeek 网页版的对话框，变成一个任何客户端都能调的 API。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                    Text("版本 \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0")")
+                    Text("版本 \((Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.0.0")")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 } header: {

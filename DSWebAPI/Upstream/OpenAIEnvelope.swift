@@ -6,7 +6,7 @@ struct OpenAIEnvelope {
     let model: String
     let created: Int
 
-    init(model: String, id: String = "chatcmpl-" + UUID().uuidString.prefix(24), created: Int = Int(Date().timeIntervalSince1970)) {
+    init(model: String, id: String = "chatcmpl-" + String(UUID().uuidString.prefix(24)), created: Int = Int(Date().timeIntervalSince1970)) {
         self.id = id
         self.model = model
         self.created = created
@@ -14,16 +14,18 @@ struct OpenAIEnvelope {
 
     /// 流式分片
     func chunk(delta: [String: Any], finishReason: String?) -> String {
+        var choice: [String: Any] = ["index": 0, "delta": delta]
+        if let reason = finishReason {
+            choice["finish_reason"] = reason
+        } else {
+            choice["finish_reason"] = NSNull()
+        }
         let payload: [String: Any] = [
             "id": id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
-            "choices": [[
-                "index": 0,
-                "delta": delta,
-                "finish_reason": finishReason as Any? ?? NSNull()
-            ]]
+            "choices": [choice]
         ]
         return Self.json(payload)
     }
