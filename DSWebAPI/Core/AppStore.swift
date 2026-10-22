@@ -16,11 +16,22 @@ final class AppStore: ObservableObject {
     @Published private(set) var cookiePresent = false
     @Published var statusMessage: String?
 
+    /// 本机对话的会话 ID（网页端一次只收一条 prompt，靠它把多轮串起来）
+    @Published var conversationID: String = AppStore.loadConversationID()
+
     private var bridge: BridgeServer?
 
     init() {
         settings = AppSettings.load()
         refreshCredentialState()
+    }
+
+    private static func loadConversationID() -> String {
+        let key = "dswebapi.conversationID"
+        if let existing = UserDefaults.standard.string(forKey: key) { return existing }
+        let fresh = UUID().uuidString.lowercased()
+        UserDefaults.standard.set(fresh, forKey: key)
+        return fresh
     }
 
     // MARK: - 凭证
@@ -108,6 +119,13 @@ final class AppStore: ObservableObject {
     // MARK: - 聊天
 
     func clearChat() {
+        chat.removeAll()
+    }
+
+    /// 开一段新对话（换会话 ID，让网页端另起一个会话）
+    func newConversation() {
+        conversationID = UUID().uuidString.lowercased()
+        UserDefaults.standard.set(conversationID, forKey: "dswebapi.conversationID")
         chat.removeAll()
     }
 

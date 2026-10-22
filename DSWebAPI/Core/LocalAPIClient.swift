@@ -18,6 +18,7 @@ enum LocalAPIClient {
                      port: Int,
                      apiKey: String,
                      model: String,
+                     conversationID: String,
                      handlers: StreamHandlers) {
         var request = URLRequest(url: chatURL(port: port))
         request.httpMethod = "POST"
@@ -28,11 +29,14 @@ enum LocalAPIClient {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": model,
             "stream": true,
             "messages": messages.map { ["role": $0.role, "content": $0.content] }
         ]
+        if !conversationID.isEmpty {
+            body["conversation_id"] = conversationID
+        }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [])
 
         Task {

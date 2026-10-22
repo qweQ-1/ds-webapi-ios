@@ -25,9 +25,9 @@ struct ChatView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        store.clearChat()
+                        store.newConversation()
                     } label: {
-                        Image(systemName: "trash")
+                        Image(systemName: "plus.bubble")
                     }
                 }
             }
@@ -163,6 +163,7 @@ struct ChatView: View {
                             port: store.settings.port,
                             apiKey: store.settings.apiKey,
                             model: store.settings.model,
+                            conversationID: store.conversationID,
                             handlers: LocalAPIClient.StreamHandlers(
                                 onThinking: { text in
                                     DispatchQueue.main.async { store.appendAssistantThinking(text) }

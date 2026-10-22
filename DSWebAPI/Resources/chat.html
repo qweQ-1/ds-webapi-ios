@@ -116,9 +116,22 @@ $('model').onchange = () => {
   state.model = $('model').value;
   localStorage.setItem('ds_model', state.model);
 };
-$('clear').onclick = () => { state.messages = []; render(); };
+$('clear').onclick = () => {
+  state.messages = [];
+  localStorage.removeItem('ds_conversation');
+  render();
+};
 
 function setLog(text) { $('log').textContent = text; }
+
+function conversationId() {
+  let id = localStorage.getItem('ds_conversation');
+  if (!id) {
+    id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random();
+    localStorage.setItem('ds_conversation', id);
+  }
+  return id;
+}
 
 async function checkHealth() {
   try {
@@ -185,7 +198,12 @@ async function send() {
     const res = await fetch('/v1/chat/completions', {
       method: 'POST',
       headers: headers,
-      body: JSON.stringify({ model: state.model, stream: true, messages: state.messages.filter(m => m.role === 'user' || (m.role === 'assistant' && m.content)) })
+      body: JSON.stringify({
+        model: state.model,
+        stream: true,
+        conversation_id: conversationId(),
+        messages: state.messages.filter(m => m.role === 'user' || (m.role === 'assistant' && m.content))
+      })
     });
 
     if (!res.ok) {
