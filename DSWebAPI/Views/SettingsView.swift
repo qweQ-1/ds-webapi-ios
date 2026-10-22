@@ -151,6 +151,7 @@ struct LoginSheet: View {
     var onCredential: (String, String, String) -> Void
 
     @State private var status: String = "正在打开 DeepSeek 网页…"
+    @State private var manualToken: String = ""
 
     var body: some View {
         NavigationStack {
@@ -158,7 +159,8 @@ struct LoginSheet: View {
                 Text(status)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .padding(8)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
                 Divider()
                 LoginWebView(
                     onToken: { token in
@@ -171,6 +173,27 @@ struct LoginSheet: View {
                         status = text
                     }
                 )
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("没自动抓到？把网页里的 token 手动贴进来")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    TextField("access token", text: $manualToken)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.system(.caption, design: .monospaced))
+                    Button("保存这个 token") {
+                        let trimmed = manualToken.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmed.isEmpty else { return }
+                        onCredential(trimmed, "", "已手动保存 access token")
+                    }
+                    .font(.caption)
+                    .disabled(manualToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Text("在电脑浏览器登录 DeepSeek 后按 F12 → Application → Local Storage → userToken，复制它的值")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(12)
             }
             .navigationTitle("登录 DeepSeek")
             .navigationBarTitleDisplayMode(.inline)
