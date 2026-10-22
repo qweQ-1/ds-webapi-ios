@@ -27,16 +27,35 @@ struct DeepSeekWebClient {
     }
 
     /// 工作量证明题目
+    ///
+    /// 网页端的算法（DeepSeekHashV1）：
+    ///   prefix = "<salt>_<expireAt>_"
+    ///   找最小 n，使得 SHA3-256(prefix + String(n)) 的 hex == challenge
+    ///   n 的搜索上限就是 difficulty
     struct Challenge {
         var algorithm: String = "DeepSeekHashV1"
+        /// 目标哈希（hex）
         var challenge: String = ""
-        var salt: Int = 0
+        /// 前缀里用的 salt（按网页端给的样子存字符串）
+        var salt: String = ""
+        /// 前缀里用的过期时间戳
+        var expireAt: String = ""
+        /// 迭代次数上限
         var difficulty: Int = 0
         var signature: String = ""
-        var expireAt: Double?
+
+        /// 前缀
+        var prefix: String { "\(salt)_\(expireAt)_" }
+
+        /// 放回 PoW 头里的 salt（数字形态）
+        var saltNumber: Any {
+            if let value = Int(salt) { return value }
+            if let value = Double(salt) { return value }
+            return salt
+        }
 
         /// 解题：找最小 n，使 SHA3-256(prefix + n) == challenge
-        func solve(maxIterations: Int = 20_000_000) throws -> Int {
+        func solve(maxIterations: Int = 50_000_000) throws -> Int {
             guard algorithm == "DeepSeekHashV1" else {
                 throw UpstreamError.powFailed("不支持的算法：\(algorithm)")
             }
@@ -46,12 +65,12 @@ struct DeepSeekWebClient {
             guard let target = SHA3Digest.hexBytes(challenge) else {
                 throw UpstreamError.powFailed("挑战不是合法的 hex")
             }
-            let prefix = Array("\(challenge)_\(difficulty)_".utf8)
-            let limit = min(max(salt, 1), maxIterations)
+            let prefixBytes = Array(prefix.utf8)
+            let limit = min(max(difficulty, 1), maxIterations)
             var digest = SHA3Digest()
             for index in 0..<limit {
                 digest.reset()
-                digest.update(prefix)
+                digest.update(prefixBytes)
                 for byte in String(index).utf8 { digest.update(byte: byte) }
                 if digest.finalizeEquals(target) { return index }
             }
@@ -133,26 +152,19 @@ struct DeepSeekWebClient {
         guard let dict = Self.findChallenge(in: json) else {
             throw UpstreamError.challengeFailed("没拿到 PoW 题目：" + String(String(decoding: data, as: UTF8.self).prefix(200)))
         }
-        var challenge = Challenge()
-        challenge.algorithm = (dict["algorithm"] as? String) ?? "DeepSeekHashV1"
-        challenge.challenge = (dict["challenge"] as? String) ?? ""
-        challenge.salt = Self.intValue(dict["salt"]) ?? 0
-        challenge.difficulty = Self.intValue(dict["difficulty"]) ?? 0
-        challenge.signature = (dict["signature"] as? String) ?? ""
-        challenge.expireAt = Self.doubleValue(dict["expire_at"])
-        return challenge
+        return Self.parseChallenge(dict)
     }
 
     /// 组装 `X-DS-PoW-Response`（已登录）/ `X-DS-Guest-PoW-Response`（访客）
     func powHeaderValue(challenge: Challenge, answer: Int, guest: Bool) -> String {
         var payload: [String: Any]
         if guest {
-            payload = ["salt": challenge.salt, "answer": answer]
+            payload = ["salt": challenge.saltNumber, "answer": answer]
         } else {
             payload = [
                 "algorithm": challenge.algorithm,
                 "challenge": challenge.challenge,
-                "salt": challenge.salt,
+                "salt": challenge.saltNumber,
                 "answer": answer,
                 "signature": challenge.signature,
                 "target_path": Self.chatPath
@@ -244,6 +256,18 @@ struct DeepSeekWebClient {
 
     // MARK: - 解析工具
 
+    /// 把服务器返回的 challenge 字典转成 Challenge
+    static func parseChallenge(_ dict: [String: Any]) -> Challenge {
+        var challenge = Challenge()
+        challenge.algorithm = (dict["algorithm"] as? String) ?? "DeepSeekHashV1"
+        challenge.challenge = (dict["challenge"] as? String) ?? ""
+        challenge.salt = jsString(dict["salt"])
+        challenge.difficulty = intValue(dict["difficulty"]) ?? 0
+        challenge.signature = (dict["signature"] as? String) ?? ""
+        challenge.expireAt = jsString(dict["expireAt"] ?? dict["expire_at"])
+        return challenge
+    }
+
     /// 在任意 JSON 里找到带 salt/challenge 的那层字典
     static func findChallenge(in json: Any) -> [String: Any]? {
         if let dict = json as? [String: Any] {
@@ -284,6 +308,25 @@ struct DeepSeekWebClient {
             return nil
         }
         return errorMessage(in: json)
+    }
+
+    /// 尽量还原网页端 JavaScript 的字符串化规则
+    static func jsString(_ any: Any?) -> String {
+        guard let any else { return "" }
+        if let text = any as? String { return text }
+        if let number = any as? NSNumber {
+            if CFNumberIsFloatType(number) {
+                let value = number.doubleValue
+                if value == value.rounded(), abs(value) < 1e21 {
+                    return String(Int64(value))
+                }
+                return String(value)
+            }
+            return String(number.int64Value)
+        }
+        if let value = any as? Int { return String(value) }
+        if let value = any as? Double { return String(Int64(value)) }
+        return String(describing: any)
     }
 
     static func intValue(_ any: Any?) -> Int? {

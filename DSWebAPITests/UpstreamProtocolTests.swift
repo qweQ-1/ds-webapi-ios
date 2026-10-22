@@ -85,24 +85,49 @@ final class UpstreamProtocolTests: XCTestCase {
 
     // MARK: - 工作量证明
 
-    /// 真实向量：SHA3-256("testchallenge_4_29510") 的 hex 就是 challenge
+    /// 真实向量：prefix = "<salt>_<expireAt>_"，SHA3-256(prefix + "257") == challenge
     func testProofOfWorkSolvesKnownVector() throws {
         var challenge = DeepSeekWebClient.Challenge()
         challenge.algorithm = "DeepSeekHashV1"
-        challenge.challenge = "00004e35fc23498f9ff49d185533f187d0c019b1e1b41cb119c956b0d2a76180"
-        challenge.salt = 29511
-        challenge.difficulty = 4
+        challenge.challenge = "0073b08ac980ce93ca1329ba719987fae7e4fb175686d0bf1f522494402bcf95"
+        challenge.salt = "1234567890123456"
+        challenge.expireAt = "1792670999665"
+        challenge.difficulty = 258
         challenge.signature = "sig"
 
+        XCTAssertEqual(challenge.prefix, "1234567890123456_1792670999665_")
         let answer = try challenge.solve()
-        XCTAssertEqual(answer, 29510)
+        XCTAssertEqual(answer, 257)
+    }
+
+    func testParsesChallengeFromServerDict() {
+        let dict: [String: Any] = [
+            "algorithm": "DeepSeekHashV1",
+            "challenge": "0073b08ac980ce93ca1329ba719987fae7e4fb175686d0bf1f522494402bcf95",
+            "salt": 1234567890123456,
+            "difficulty": 258,
+            "signature": "sig-1",
+            "expire_at": 1792670999665
+        ]
+        let challenge = DeepSeekWebClient.parseChallenge(dict)
+        XCTAssertEqual(challenge.algorithm, "DeepSeekHashV1")
+        XCTAssertEqual(challenge.salt, "1234567890123456")
+        XCTAssertEqual(challenge.expireAt, "1792670999665")
+        XCTAssertEqual(challenge.difficulty, 258)
+        XCTAssertEqual(challenge.prefix, "1234567890123456_1792670999665_")
+    }
+
+    func testJSStringFormatting() {
+        XCTAssertEqual(DeepSeekWebClient.jsString(12345 as NSNumber), "12345")
+        XCTAssertEqual(DeepSeekWebClient.jsString(1792670999665 as NSNumber), "1792670999665")
+        XCTAssertEqual(DeepSeekWebClient.jsString("abc" as String), "abc")
     }
 
     func testProofOfWorkRejectsUnknownAlgorithm() {
         var challenge = DeepSeekWebClient.Challenge()
         challenge.algorithm = "Nope"
         challenge.challenge = "00"
-        challenge.salt = 10
+        challenge.salt = "10"
         XCTAssertThrowsError(try challenge.solve())
     }
 
@@ -110,7 +135,7 @@ final class UpstreamProtocolTests: XCTestCase {
         var challenge = DeepSeekWebClient.Challenge()
         challenge.algorithm = "DeepSeekHashV1"
         challenge.challenge = "abc"
-        challenge.salt = 100
+        challenge.salt = "100"
         challenge.difficulty = 4
         challenge.signature = "sig"
 
@@ -130,7 +155,7 @@ final class UpstreamProtocolTests: XCTestCase {
 
     func testGuestPowHeaderOnlyCarriesSaltAndAnswer() throws {
         var challenge = DeepSeekWebClient.Challenge()
-        challenge.salt = 42
+        challenge.salt = "42"
         let client = makeClient()
         let header = client.powHeaderValue(challenge: challenge, answer: 3, guest: true)
 
