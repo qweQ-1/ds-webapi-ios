@@ -109,7 +109,21 @@ struct LoginWebView: UIViewRepresentable {
                     return
                 }
 
-                // 3) 读 Cookie
+                // 3) 读 Cookie：页面 cookie 里如果直接带 JWT 也能用
+                if let cookieText = object["cookie"] as? String, !cookieText.isEmpty {
+                    for piece in cookieText.components(separatedBy: ";") {
+                        let value = piece.split(separator: "=", maxSplits: 1).last.map(String.init) ?? ""
+                        if CredentialExtractor.looksLikeToken(value) {
+                            self.didCaptureToken = true
+                            self.timer?.invalidate()
+                            self.parent.onToken(value)
+                            self.parent.onStatus("已抓到 access token（Cookie）")
+                            return
+                        }
+                    }
+                }
+
+                // 4) 读 Cookie 存到 WKHTTPCookieStore
                 webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
                     let header = CredentialExtractor.cookieHeader(from: cookies)
                     guard !header.isEmpty else { return }
