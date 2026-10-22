@@ -85,12 +85,12 @@ struct ChatView: View {
                 }
                 .padding(16)
             }
-            .onChange(of: store.chat.count) { _ in
+            .onChange(of: store.chat.count) {
                 if let last = store.chat.last {
                     withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
             }
-            .onChange(of: store.chat.last?.content ?? "") { _ in
+            .onChange(of: store.chat.last?.content ?? "") {
                 if let last = store.chat.last {
                     proxy.scrollTo(last.id, anchor: .bottom)
                 }
