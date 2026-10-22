@@ -1,0 +1,7 @@
+- [ ] 全新安装：能在 App 内登录 DeepSeek 并抓到 access token
+- [ ] 「接口」页启动服务后，/health 返回正常
+- [ ] App 内「聊天」页能收到流式回复
+- [ ] 同一 Wi-Fi 下电脑浏览器能打开 http://<iPhone>:8787/ 网页聊天框
+- [ ] curl 调用 /v1/chat/completions 能拿到回复
+- [ ] 设置本地 API Key 后，不带 Key 的请求返回 401
+- [ ] 杀掉 App 重开：凭证还在，服务能重新启动

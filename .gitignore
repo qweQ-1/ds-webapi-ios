@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+*.xcarchive
+*.ipa
+*.dSYM/
+
+# SwiftPM
+.build/
+.swiftpm/
+
+# XcodeGen 生成的工程（由 CI / 本地 xcodegen generate 生成，不入库）
+*.xcodeproj/
+
+# XcodeGen 生成的 Info.plist（由 project.yml 的 info 段生成）
+DSWebAPI/Info.plist

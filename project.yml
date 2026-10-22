@@ -1,0 +1,79 @@
+name: DSWebAPI
+options:
+  bundleIdPrefix: com.qweq-1
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  DSWebAPI:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: DSWebAPI
+    info:
+      path: DSWebAPI/Info.plist
+      properties:
+        CFBundleDisplayName: "DeepSeek 转 API"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen: {}
+        UIApplicationSupportsIndirectInputEvents: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        ITSAppUsesNonExemptEncryption: false
+        UIBackgroundModes:
+          - audio
+        NSLocalNetworkUsageDescription: "用于在同一 Wi-Fi 下让电脑或手机访问本机提供的 DeepSeek 兼容 API。"
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSExceptionDomains:
+            127.0.0.1:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+            localhost:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.qweq-1.dswebapi
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_PREVIEWS: "YES"
+
+  DSWebAPITests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: DSWebAPITests
+    dependencies:
+      - target: DSWebAPI
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.qweq-1.dswebapi.tests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/DSWebAPI.app/DSWebAPI"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
+schemes:
+  DSWebAPI:
+    build:
+      targets:
+        DSWebAPI: all
+        DSWebAPITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - DSWebAPITests

@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>DeepSeek 网页端转 API</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --text: #e6e8ee;
+    --muted: #8b93a7;
+    --accent: #4d6bfe;
+    --accent-2: #2f3f9e;
+    --border: #262b36;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7fb; --panel: #ffffff; --panel-2: #f0f2f8;
+      --text: #1a1c22; --muted: #6b7280; --border: #e2e5ee;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    background: var(--panel);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  select, input {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; font-size: 13px;
+    outline: none;
+  }
+  input.key { width: 130px; }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+    padding: 7px 12px; font-size: 13px; cursor: pointer;
+  }
+  button.ghost { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
+  #log { font-size: 11px; color: var(--muted); padding: 4px 14px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  #chat { flex: 1; overflow-y: auto; padding: 16px; }
+  .msg { max-width: 760px; margin: 0 auto 14px; display: flex; gap: 10px; }
+  .msg .role { flex: 0 0 32px; height: 32px; border-radius: 9px; display: grid; place-items: center;
+    font-size: 12px; font-weight: 600; background: var(--panel-2); color: var(--muted); }
+  .msg.user .role { background: var(--accent); color: #fff; }
+  .bubble {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 10px 12px; white-space: pre-wrap; word-break: break-word; flex: 1;
+  }
+  .msg.user .bubble { background: var(--accent-2); border-color: transparent; color: #fff; }
+  .think {
+    font-size: 12.5px; color: var(--muted); border-left: 2px solid var(--border);
+    padding: 4px 0 4px 10px; margin-bottom: 8px; white-space: pre-wrap;
+  }
+  .cursor::after { content: "▍"; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #composer { border-top: 1px solid var(--border); padding: 10px 14px 14px; background: var(--panel); }
+  #wrap { max-width: 760px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }
+  #text {
+    flex: 1; background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 12px; padding: 10px 12px; font: inherit; resize: none; min-height: 44px; max-height: 160px; outline: none;
+  }
+  .hint { font-size: 12px; color: var(--muted); text-align: center; padding-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>DeepSeek 网页端 → API</h1>
+  <select id="model">
+    <option value="deepseek-chat">deepseek-chat</option>
+    <option value="deepseek-reasoner">deepseek-reasoner</option>
+    <option value="deepseek-coder">deepseek-coder</option>
+  </select>
+  <input class="key" id="key" type="password" placeholder="本地 API Key（可选）">
+  <button class="ghost" id="savekey">保存 Key</button>
+  <button class="ghost" id="clear">清空对话</button>
+  <span class="spacer"></span>
+</header>
+<div id="log">正在连接本机 API…</div>
+<div id="chat"></div>
+<div id="composer">
+  <div id="wrap">
+    <textarea id="text" rows="1" placeholder="发消息…（Enter 发送，Shift+Enter 换行）"></textarea>
+    <button id="send">发送</button>
+  </div>
+  <div class="hint">这个网页聊天框调用的就是 App 提供的 <code>/v1/chat/completions</code>，与 App 内置聊天框同一条链路。</div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const state = {
+  key: localStorage.getItem('ds_key') || '',
+  model: localStorage.getItem('ds_model') || 'deepseek-chat',
+  messages: [],
+  busy: false
+};
+$('key').value = state.key;
+$('model').value = state.model;
+
+$('savekey').onclick = () => {
+  state.key = $('key').value.trim();
+  localStorage.setItem('ds_key', state.key);
+  $('key').value = state.key;
+  setLog(state.key ? '本地 API Key 已保存' : '本地 API Key 已清除');
+};
+$('model').onchange = () => {
+  state.model = $('model').value;
+  localStorage.setItem('ds_model', state.model);
+};
+$('clear').onclick = () => { state.messages = []; render(); };
+
+function setLog(text) { $('log').textContent = text; }
+
+async function checkHealth() {
+  try {
+    const res = await fetch('/health', { cache: 'no-store' });
+    const data = await res.json();
+    setLog('本机 API 正常 · 模型 ' + (data.model || '-') + ' · 凭证 ' + (data.has_token ? '已配置' : '未配置'));
+  } catch (e) {
+    setLog('连不上本机 API：' + e.message);
+  }
+}
+
+function render() {
+  const box = $('chat');
+  box.innerHTML = '';
+  if (state.messages.length === 0) {
+    const hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.textContent = '还没有对话。说点什么试试 —— 请求会先打到本机 API，再转发给 DeepSeek 网页端。';
+    box.appendChild(hint);
+    return;
+  }
+  state.messages.forEach((m) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg ' + m.role;
+    const role = document.createElement('div');
+    role.className = 'role';
+    role.textContent = m.role === 'user' ? '我' : 'AI';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    if (m.thinking) {
+      const think = document.createElement('div');
+      think.className = 'think';
+      think.textContent = m.thinking;
+      bubble.appendChild(think);
+    }
+    const body = document.createElement('div');
+    body.textContent = m.content || (m.streaming ? '' : '');
+    if (m.streaming) body.className = 'cursor';
+    bubble.appendChild(body);
+    wrap.appendChild(role);
+    wrap.appendChild(bubble);
+    box.appendChild(wrap);
+  });
+  box.scrollTop = box.scrollHeight;
+}
+
+async function send() {
+  const input = $('text');
+  const text = input.value.trim();
+  if (!text || state.busy) return;
+  input.value = '';
+  input.style.height = 'auto';
+
+  state.messages.push({ role: 'user', content: text });
+  const reply = { role: 'assistant', content: '', thinking: '', streaming: true };
+  state.messages.push(reply);
+  state.busy = true;
+  render();
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (state.key) headers['Authorization'] = 'Bearer ' + state.key;
+
+  try {
+    const res = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({ model: state.model, stream: true, messages: state.messages.filter(m => m.role === 'user' || (m.role === 'assistant' && m.content)) })
+    });
+
+    if (!res.ok) {
+      const text2 = await res.text();
+      throw new Error('HTTP ' + res.status + ' ' + text2.slice(0, 300));
+    }
+    if (!res.body) throw new Error('浏览器不支持流式响应');
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let first = true;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split('\n\n');
+      buffer = blocks.pop();
+      for (const block of blocks) {
+        for (const line of block.split('\n')) {
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload || payload === '[DONE]') continue;
+          let json;
+          try { json = JSON.parse(payload); } catch (e) { continue; }
+          if (json.error) { throw new Error(json.error.message || '上游错误'); }
+          const delta = json.choices && json.choices[0] && json.choices[0].delta;
+          if (!delta) continue;
+          if (delta.reasoning_content) { reply.thinking += delta.reasoning_content; }
+          if (delta.content) { reply.content += delta.content; }
+          if (first) { first = false; }
+          render();
+        }
+      }
+    }
+    setLog('完成');
+  } catch (err) {
+    reply.content = (reply.content ? reply.content + '\n' : '') + '⚠️ ' + err.message;
+    setLog('请求失败：' + err.message);
+  }
+  reply.streaming = false;
+  state.busy = false;
+  render();
+}
+
+$('send').onclick = send;
+$('text').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$('text').addEventListener('input', (e) => {
+  e.target.style.height = 'auto';
+  e.target.style.height = Math.min(e.target.scrollHeight, 160) + 'px';
+});
+
+render();
+checkHealth();
+setInterval(checkHealth, 30000);
+</script>
+</body>
+</html>

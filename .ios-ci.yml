@@ -1,0 +1,21 @@
+# DSWebAPI 的 CI 配置：所有工作流都从这里读设置，入口文件里只剩 uses: 和 secrets:。
+# 完整说明见 ios-ci-workflows 的 docs/config.md。
+
+workdir: .
+project: DSWebAPI.xcodeproj
+scheme: DSWebAPI
+bundle_id: com.qweq-1.dswebapi
+display_name: 'DeepSeek 转 API'
+generate_command: xcodegen generate
+
+toolchain:
+  xcode: '26.6'
+  simulator: iPhone 17 Pro
+  ios: '26.4'
+
+build_test:
+  accessibility_audit: warn
+
+testflight:
+  entitlement_mode: none
+  acceptance_issue: true
