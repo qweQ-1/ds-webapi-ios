@@ -22,6 +22,12 @@ enum CredentialExtractor {
         for (_, raw) in storage {
             if let token = token(inBlob: raw) { return token }
         }
+
+        // 3) 兜底：任何长得像 JWT 的值
+        for (_, raw) in storage {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("eyJ"), trimmed.contains(".") { return trimmed }
+        }
         return nil
     }
 
