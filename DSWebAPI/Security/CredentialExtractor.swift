@@ -14,7 +14,8 @@ enum CredentialExtractor {
             guard lowercasedKeys.contains(key.lowercased()) else { continue }
             if let token = token(inBlob: raw) { return token }
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if looksLikeToken(trimmed) { return trimmed }
+            // 网页端的 userToken 常常是不透明的字符串，不是 JWT，也要认
+            if !trimmed.isEmpty, !trimmed.hasPrefix("{") { return trimmed }
         }
 
         // 2) 再在所有 value 里递归找

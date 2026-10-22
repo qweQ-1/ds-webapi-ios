@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 /// DeepSeek 网页端（chat.deepseek.com）内部接口的客户端。
 ///
@@ -44,15 +43,17 @@ struct DeepSeekWebClient {
             guard !challenge.isEmpty else {
                 throw UpstreamError.powFailed("挑战内容为空")
             }
-            let prefix = Data("\(challenge)_\(difficulty)_".utf8)
+            guard let target = SHA3Digest.hexBytes(challenge) else {
+                throw UpstreamError.powFailed("挑战不是合法的 hex")
+            }
+            let prefix = Array("\(challenge)_\(difficulty)_".utf8)
             let limit = min(max(salt, 1), maxIterations)
+            var digest = SHA3Digest()
             for index in 0..<limit {
-                var hasher = SHA3_256()
-                hasher.update(data: prefix)
-                hasher.update(data: Data(String(index).utf8))
-                let digest = hasher.finalize()
-                let hex = digest.map { String(format: "%02x", $0) }.joined()
-                if hex == challenge { return index }
+                digest.reset()
+                digest.update(prefix)
+                digest.update(Array(String(index).utf8))
+                if digest.finalize() == target { return index }
             }
             throw UpstreamError.powFailed("工作量证明没算出来（尝试 \(limit) 次）")
         }
