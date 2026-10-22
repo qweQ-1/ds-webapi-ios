@@ -52,8 +52,8 @@ struct DeepSeekWebClient {
             for index in 0..<limit {
                 digest.reset()
                 digest.update(prefix)
-                digest.update(Array(String(index).utf8))
-                if digest.finalize() == target { return index }
+                for byte in String(index).utf8 { digest.update(byte: byte) }
+                if digest.finalizeEquals(target) { return index }
             }
             throw UpstreamError.powFailed("工作量证明没算出来（尝试 \(limit) 次）")
         }
@@ -195,7 +195,11 @@ struct DeepSeekWebClient {
             "action": NSNull(),
             "preempt": NSNull()
         ]
-        body["parent_message_id"] = parentMessageID ?? NSNull()
+        if let parent = parentMessageID {
+            body["parent_message_id"] = parent
+        } else {
+            body["parent_message_id"] = NSNull()
+        }
         body["source"] = NSNull()
         request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
 

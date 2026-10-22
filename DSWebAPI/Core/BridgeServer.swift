@@ -83,10 +83,10 @@ final class BridgeServer {
         }
         try http.start(port: UInt16(settings.port))
         server = http
-        boundPort = settings.port
+        boundPort = UInt16(settings.port)
         isRunning = true
         logger(.ok, "本地 API 已启动：http://0.0.0.0:\(settings.port)/v1")
-        return settings.port
+        return UInt16(settings.port)
     }
 
     func stop() {

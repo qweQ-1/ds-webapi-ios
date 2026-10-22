@@ -49,6 +49,16 @@ struct SHA3Digest {
         update(Array(text.utf8))
     }
 
+    /// 逐字节写入（PoW 循环里避免每次分配数组）
+    mutating func update(byte: UInt8) {
+        buffer[bufferCount] = byte
+        bufferCount += 1
+        if bufferCount == SHA3Digest.rate {
+            absorbBlock()
+            bufferCount = 0
+        }
+    }
+
     /// 收尾（会填充并置换，调用后需要 reset 才能再用）
     mutating func finalize() -> [UInt8] {
         // pad10*1，域分隔符 0x06
@@ -67,6 +77,31 @@ struct SHA3Digest {
             }
         }
         return output
+    }
+
+    /// 收尾后直接和目标字节比较（PoW 热路径，省一次数组分配）
+    mutating func finalizeEquals(_ target: [UInt8]) -> Bool {
+        buffer[bufferCount] = 0x06
+        if bufferCount + 1 < SHA3Digest.rate {
+            for index in (bufferCount + 1)..<(SHA3Digest.rate - 1) { buffer[index] = 0 }
+        }
+        buffer[SHA3Digest.rate - 1] |= 0x80
+        absorbBlock()
+
+        let lanes = target.count / 8
+        for lane in 0..<lanes {
+            let value = state[lane]
+            for byte in 0..<8 {
+                if UInt8((value >> UInt64(8 * byte)) & 0xFF) != target[lane * 8 + byte] { return false }
+            }
+        }
+        for index in (lanes * 8)..<target.count {
+            let lane = index / 8
+            let byte = index % 8
+            let value = state[lane]
+            if UInt8((value >> UInt64(8 * byte)) & 0xFF) != target[index] { return false }
+        }
+        return true
     }
 
     /// 一次性算 SHA3-256
