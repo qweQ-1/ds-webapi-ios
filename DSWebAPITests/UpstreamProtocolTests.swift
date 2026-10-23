@@ -44,6 +44,29 @@ final class UpstreamProtocolTests: XCTestCase {
         XCTAssertNotNil(request.value(forHTTPHeaderField: "x-client-timezone-offset"))
     }
 
+    func testCompletionRequestCarriesHIFRiskHeaders() throws {
+        let client = makeClient()
+        let request = try client.makeCompletionRequest(prompt: "hi",
+                                                        options: .init(),
+                                                        chatSessionID: "session-1",
+                                                        parentMessageID: nil,
+                                                        powHeader: "BASE64VALUE",
+                                                        hifHeaders: [
+                                                            "x-hif-leim": "LEIM-VALUE",
+                                                            "x-hif-dliq": "DLIQ-VALUE"
+                                                        ])
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-hif-leim"), "LEIM-VALUE")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-hif-dliq"), "DLIQ-VALUE")
+    }
+
+    func testSharedClientHeadersDoNotLeakCredentials() {
+        let headers = makeClient().clientHeaderFields
+        XCTAssertEqual(headers["x-device-id"], "device-abc")
+        XCTAssertNotNil(headers["x-client-version"])
+        XCTAssertNil(headers["Authorization"])
+        XCTAssertNil(headers["Cookie"])
+    }
+
     func testCompletionRequestBodyHasExpectedFields() throws {
         var options = DeepSeekWebClient.Options()
         options.modelType = "deepseek-reasoner"
@@ -226,6 +249,23 @@ final class UpstreamProtocolTests: XCTestCase {
 
     // MARK: - 会话登记
 
+    func testMapsModelToOfficialModelType() {
+        XCTAssertEqual(DeepSeekWebClient.upstreamModelType("deepseek-chat"), "default")
+        XCTAssertEqual(DeepSeekWebClient.upstreamModelType("deepseek-reasoner"), "expert")
+        XCTAssertEqual(DeepSeekWebClient.upstreamModelType("deepseek-coder"), "default")
+        XCTAssertEqual(DeepSeekWebClient.upstreamModelType("anything-else"), "default")
+    }
+
+    func testFindsSessionIDInsideCreateResponse() throws {
+        let raw = """
+        {"code":0,"data":{"biz_code":0,"biz_msg":"","biz_data":{"chat_session":{
+            "id":"e6795fb3-272f-4782-87cf-6d6140b5bf76"}}}}
+        """
+        let json = try JSONSerialization.jsonObject(with: Data(raw.utf8), options: [.fragmentsAllowed])
+        let found = try XCTUnwrap(DeepSeekWebClient.chatSessionID(in: json))
+        XCTAssertEqual(found, "e6795fb3-272f-4782-87cf-6d6140b5bf76")
+    }
+
     func testConversationStoreReusesSessionForSameConversation() {
         let store = BridgeServer.ConversationStore()
         let first = store.state(for: "k", fingerprint: "第一句", messageCount: 1)
@@ -241,5 +281,24 @@ final class UpstreamProtocolTests: XCTestCase {
         let other = store.state(for: "k", fingerprint: "另一句", messageCount: 1)
         XCTAssertNotEqual(first.chatSessionID, other.chatSessionID)
         XCTAssertNil(other.lastMessageID)
+    }
+
+    func testConversationStoreMarksLocalSessionsWithAutoPrefix() {
+        let store = BridgeServer.ConversationStore()
+        let local = store.state(for: "k", fingerprint: "x", messageCount: 1)
+        XCTAssertTrue(local.chatSessionID.hasPrefix("auto-"))
+    }
+
+    func testConversationStoreCanReplaceWithServerSession() {
+        let store = BridgeServer.ConversationStore()
+        let local = store.state(for: "k", fingerprint: "x", messageCount: 1)
+        let serverID = "e6795fb3-272f-4782-87cf-6d6140b5bf76"
+        let serverState = BridgeServer.ConversationState(chatSessionID: serverID,
+                                                         lastMessageID: local.lastMessageID,
+                                                         fingerprint: "x",
+                                                         messageCount: 1)
+        store.replace(state: serverState, for: "k")
+        let reused = store.state(for: "k", fingerprint: "x", messageCount: 2)
+        XCTAssertEqual(reused.chatSessionID, serverID)
     }
 }

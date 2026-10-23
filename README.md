@@ -9,7 +9,7 @@ iOS App 在本机跑一个 HTTP 服务，把网页端内部接口翻译成标准
         │  POST http://<你的iPhone>:8787/v1/chat/completions
         ▼
    DSWebAPI（iPhone 上的 HTTP 服务）
-        │  POST https://chat.deepseek.com/api/v0/chat/completions
+        │  POST https://chat.deepseek.com/api/v0/chat/completion
         │  Authorization: Bearer <网页端 access token>
         ▼
    DeepSeek 网页端
@@ -60,6 +60,18 @@ iOS App 在本机跑一个 HTTP 服务，把网页端内部接口翻译成标准
 - access token / session cookie 只存在 iOS 钥匙串（Keychain），不写 UserDefaults、不上传任何第三方。
 - 可以给本地 API 设置一个 `本地 API Key`，之后所有请求都要带 `Authorization: Bearer <key>`，避免同网段别人白用。
 - 本机地址 `127.0.0.1` 只有本机能访问；局域网地址请在公共 Wi-Fi 下慎用。
+
+## 兼容最新网页端
+
+DeepSeek 网页端近期的反向适配要点：
+
+- **HIF 风控令牌**：官方前端会轮询 `hif-leim` / `hif-dliq` 两个无鉴权端点，把返回的令牌
+  以 `x-hif-leim` / `x-hif-dliq` 附加到 SSE 聊天请求上，缺失会被判定为非官方客户端。
+  本 App 已按设备 ID 自动获取并缓存这两个令牌，取不到时跳过对应头、不阻断聊天。
+- **真实会话**：「设置 → 调试 → 用官方接口建立真实会话」默认关闭；开启后每次新会话都会
+  调用官方 `/chat_session/create` 建立真实网页端会话（而非本地随机 UUID），失败自动退回本地会话。
+- **模型映射**：网页端内部的 `model_type` 是 `default` / `expert`；`deepseek-chat`/`deepseek-coder`→`default`，
+  `deepseek-reasoner`→`expert`，由 App 自动翻译。
 
 ## 工程
 

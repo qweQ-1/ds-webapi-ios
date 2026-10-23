@@ -101,6 +101,13 @@ struct SettingsView: View {
 
                 Section {
                     Toggle("记录上游原始事件", isOn: $store.settings.showRawStream)
+                    Toggle("用官方接口建立真实会话", isOn: $store.settings.useServerSession)
+                        .onChange(of: store.settings.useServerSession) { _ in store.settings.save() }
+                    if store.settings.useServerSession {
+                        Text("按官方前端流程调用 /chat_session/create 建立会话。若上游拒绝该端点，会自动退回本地会话。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                     VStack(alignment: .leading, spacing: 4) {
                         Text("设备 ID")
                             .font(.caption)

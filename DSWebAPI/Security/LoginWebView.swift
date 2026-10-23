@@ -182,7 +182,7 @@ struct LoginWebView: UIViewRepresentable {
           try {
             for (var i = 0; i < sessionStorage.length; i++) {
               var k = sessionStorage.key(i);
-              out.ss[k] = sessionStorage.getItem(i);
+              out.ss[k] = sessionStorage.getItem(k);
             }
           } catch (e) {}
           var cookie = '';

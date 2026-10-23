@@ -11,6 +11,8 @@ struct AppSettings: Codable, Equatable {
     var thinkingEnabled: Bool = false
     /// 是否让 DeepSeek 联网搜索
     var searchEnabled: Bool = false
+    /// 用官方 /chat_session/create 建立真实网页端会话（而非本地随机 UUID）
+    var useServerSession: Bool = false
     /// 每次请求都带上这段系统提示词
     var systemPrompt: String = ""
     var temperature: Double = 0.7
@@ -24,7 +26,7 @@ struct AppSettings: Codable, Equatable {
     /// 把上游原始 SSE 打到日志里（协议变化时用来适配）
     var showRawStream: Bool = false
     /// 上游客户端版本头
-    var clientVersion: String = "20250101.99999"
+    var clientVersion: String = "2.7.0"
     /// 设备型号（网页端要求带 x-device-model）
     var deviceModel: String = "iPhone"
     /// 客户端平台
@@ -49,6 +51,8 @@ struct AppSettings: Codable, Equatable {
         if value.maxTokens <= 0 { value.maxTokens = 4096 }
         if value.temperature < 0 { value.temperature = 0 }
         if value.temperature > 2 { value.temperature = 2 }
+        // 旧版占位客户端版本迁移到当前官方 Web 版本。
+        if value.clientVersion == "20250101.99999" { value.clientVersion = "2.7.0" }
         return value
     }
 

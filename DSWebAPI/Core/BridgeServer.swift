@@ -36,7 +36,7 @@ final class BridgeServer {
                 states[key] = existing
                 return existing
             }
-            let fresh = ConversationState(chatSessionID: UUID().uuidString.lowercased(),
+            let fresh = ConversationState(chatSessionID: "auto-" + UUID().uuidString.lowercased(),
                                           lastMessageID: nil,
                                           fingerprint: fingerprint,
                                           messageCount: messageCount)
@@ -52,10 +52,18 @@ final class BridgeServer {
             state.lastMessageID = id
             states[key] = state
         }
+
+        /// 用官方端点返回的真实会话 ID 替换本地临时会话。
+        func replace(state: ConversationState, for key: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            states[key] = state
+        }
     }
 
     private var server: HttpServer?
     private let conversations = ConversationStore()
+    private let hifTokens = HIFTokenProvider()
 
     private let settingsProvider: () -> AppSettings
     private let tokenProvider: () -> String
@@ -86,6 +94,12 @@ final class BridgeServer {
         boundPort = UInt16(settings.port)
         isRunning = true
         logger(.ok, "本地 API 已启动：http://0.0.0.0:\(settings.port)/v1")
+
+        // 提前预热风控令牌，避免第一条聊天额外等待网络往返。
+        Task { [weak self] in
+            guard let self else { return }
+            _ = await self.hifTokens.headers(baseHeaders: self.makeClient().clientHeaderFields)
+        }
         return UInt16(settings.port)
     }
 
@@ -233,14 +247,9 @@ final class BridgeServer {
 
         let settings = settingsProvider()
 
-        // 网页端没有 system 角色，把系统提示词拼到第一条用户消息前面
-        let systemPrompt = settings.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !systemPrompt.isEmpty, messages.first?.role == "user" {
-            messages[0].content = systemPrompt + "\n\n" + messages[0].content
-        }
-
-        // 网页端一次只发一条：取最后一条用户消息
-        guard let prompt = messages.last(where: { $0.role == "user" })?.content ?? messages.last?.content else {
+        // 网页端没有 system/developer 角色，把所有系统提示词合并到本轮用户消息前面。
+        guard let prompt = Self.preparePrompt(messages: messages,
+                                              configuredSystemPrompt: settings.systemPrompt) else {
             writer.sendHead(status: 400)
             writer.write(OpenAIEnvelope.error("没有可发送的内容", code: "invalid_request"))
             writer.close()
@@ -249,11 +258,15 @@ final class BridgeServer {
 
         let requestedModel = (payload["model"] as? String) ?? settings.model
         var options = DeepSeekWebClient.Options()
-        options.modelType = requestedModel.isEmpty ? "deepseek-chat" : requestedModel
+        options.modelType = DeepSeekWebClient.upstreamModelType(
+            requestedModel.isEmpty ? settings.model : requestedModel
+        )
         options.thinkingEnabled = settings.thinkingEnabled || requestedModel.contains("reasoner")
         options.searchEnabled = settings.searchEnabled
         options.temperature = (payload["temperature"] as? Double) ?? settings.temperature
         options.maxTokens = (payload["max_tokens"] as? Int) ?? settings.maxTokens
+        // 用服务端会话端点建真实会话，需要在上游请求时携带它。
+        options.createServerSession = settings.useServerSession
 
         let wantsStream = (payload["stream"] as? Bool) ?? true
         let fingerprint = messages.first?.content ?? ""
@@ -285,22 +298,48 @@ final class BridgeServer {
         let envelope = OpenAIEnvelope(model: options.modelType)
 
         do {
+            // HIF 令牌与 PoW 并行准备，减少首轮延迟。
+            async let hifHeaders = hifTokens.headers(baseHeaders: client.clientHeaderFields)
+
             // 1) 取工作量证明题目并解出来
             let challenge = try await client.fetchChallenge(guest: guest)
             let answer = try challenge.solve()
             let powHeader = client.powHeaderValue(challenge: challenge, answer: answer, guest: guest)
             logger(.info, "PoW 已完成（answer=\(answer)，guest=\(guest)）")
 
-            // 2) 拿到（或新建）网页端会话
-            let state = conversations.state(for: conversationKey,
+            // 2) 拿到（或新建）网页端会话；需要时再走官方 create 端点换真会话。
+            var state = conversations.state(for: conversationKey,
                                            fingerprint: fingerprint,
                                            messageCount: messageCount)
+
+            let riskHeaders = await hifHeaders
+            if !riskHeaders.isEmpty {
+                logger(.info, "已附加 \(riskHeaders.count) 个 HIF 风控头")
+            }
+
+            if options.createServerSession, state.chatSessionID.starts(with: "auto-") {
+                do {
+                    let serverID = try await client.createSession()
+                    let created = BridgeServer.ConversationState(
+                        chatSessionID: serverID,
+                        lastMessageID: state.lastMessageID,
+                        fingerprint: fingerprint,
+                        messageCount: messageCount
+                    )
+                    conversations.replace(state: created, for: conversationKey)
+                    state = created
+                    logger(.info, "已通过 /chat_session/create 建立会话 \(serverID.prefix(8))")
+                } catch {
+                    logger(.warn, "服务端会话建立失败，退回本地会话：\(error.localizedDescription)")
+                }
+            }
 
             let upstreamRequest = try client.makeCompletionRequest(prompt: prompt,
                                                                     options: options,
                                                                     chatSessionID: state.chatSessionID,
                                                                     parentMessageID: state.lastMessageID,
-                                                                    powHeader: powHeader)
+                                                                    powHeader: powHeader,
+                                                                    hifHeaders: riskHeaders)
 
             if wantsStream {
                 await streamUpstream(request: upstreamRequest,
@@ -453,6 +492,27 @@ final class BridgeServer {
             }
         }
         return nil
+    }
+
+    /// 把 OpenAI 风格消息转换成网页端可发送的单条 prompt。
+    ///
+    /// DeepSeek 网页端没有 system/developer 角色，而且一次只接收一条 prompt。
+    /// 因此系统提示词必须合并到本轮最后一条用户消息中，不能只处理数组首项。
+    static func preparePrompt(messages: [DeepSeekWebClient.UpstreamMessage],
+                              configuredSystemPrompt: String) -> String? {
+        let configured = configuredSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestSystemPrompts = messages
+            .filter { $0.role == "system" || $0.role == "developer" }
+            .map { $0.content.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let systemParts = ([configured] + requestSystemPrompts).filter { !$0.isEmpty }
+
+        guard let userPrompt = messages.last(where: { $0.role == "user" })?.content
+                ?? messages.last?.content else {
+            return nil
+        }
+        guard !systemParts.isEmpty else { return userPrompt }
+        return systemParts.joined(separator: "\n\n") + "\n\n" + userPrompt
     }
 
     static func parseMessages(_ raw: Any?) -> [DeepSeekWebClient.UpstreamMessage] {

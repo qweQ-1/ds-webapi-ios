@@ -8,7 +8,8 @@ import Foundation
 /// - PoW 题目来自 `POST /api/v0/chat/create_pow_challenge`（未登录用
 ///   `POST /api/v0/users/create_guest_challenge`）
 /// - PoW 算法 `DeepSeekHashV1`：找最小 n，使得
-///   `SHA3-256("<challenge>_<difficulty>_" + String(n))` 的 hex 等于 challenge
+///   `SHA3-256("<salt>_<expireAt>_" + String(n))` 的 hex 等于 challenge
+///   （difficulty 是搜索次数上限）
 /// - 登录态 token 放在网页 localStorage 的 `userToken` 里，请求带 `Authorization: Bearer <token>`
 /// - 一次只发一条 prompt，历史由 `chat_session_id` + `parent_message_id` 在服务端串起来
 struct DeepSeekWebClient {
@@ -19,11 +20,22 @@ struct DeepSeekWebClient {
     }
 
     struct Options {
-        var modelType: String = "deepseek-chat"
+        var modelType: String = "default"
         var thinkingEnabled: Bool = false
         var searchEnabled: Bool = false
         var temperature: Double = 0.7
         var maxTokens: Int = 4096
+        /// 是否调用官方 /chat_session/create 建立真实网页端会话。
+        var createServerSession: Bool = false
+    }
+
+    /// 网页端真实的 model_type：default / expert / vision。
+    static func upstreamModelType(_ requested: String) -> String {
+        switch requested {
+        case "deepseek-reasoner": return "expert"
+        case "deepseek-coder": return "default"
+        default: return "default"
+        }
     }
 
     /// 工作量证明题目
@@ -101,15 +113,25 @@ struct DeepSeekWebClient {
 
     // MARK: - 请求头
 
+    /// 不含 Cookie / Authorization 的通用客户端身份头。
+    /// 业务请求与 HIF 风控令牌请求共用这一组设备身份信息。
+    var clientHeaderFields: [String: String] {
+        [
+            "User-Agent": Self.defaultUserAgent,
+            "x-client-locale": clientLocale,
+            "x-client-version": clientVersion,
+            "x-client-timezone-offset": String(timezoneOffsetSeconds),
+            "x-client-platform": clientPlatform,
+            "x-client-bundle-id": clientBundleID,
+            "x-device-id": deviceID,
+            "x-device-model": deviceModel
+        ]
+    }
+
     private func applyClientHeaders(_ request: inout URLRequest) {
-        request.setValue(Self.defaultUserAgent, forHTTPHeaderField: "User-Agent")
-        request.setValue(clientLocale, forHTTPHeaderField: "x-client-locale")
-        request.setValue(clientVersion, forHTTPHeaderField: "x-client-version")
-        request.setValue(String(timezoneOffsetSeconds), forHTTPHeaderField: "x-client-timezone-offset")
-        request.setValue(clientPlatform, forHTTPHeaderField: "x-client-platform")
-        request.setValue(clientBundleID, forHTTPHeaderField: "x-client-bundle-id")
-        request.setValue(deviceID, forHTTPHeaderField: "x-device-id")
-        request.setValue(deviceModel, forHTTPHeaderField: "x-device-model")
+        for (name, value) in clientHeaderFields {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
         let cookie = sessionCookie.trimmingCharacters(in: .whitespacesAndNewlines)
         if !cookie.isEmpty {
             request.setValue(cookie, forHTTPHeaderField: "Cookie")
@@ -123,6 +145,54 @@ struct DeepSeekWebClient {
             throw UpstreamError.badResponse("上游地址无效：\(baseURL.absoluteString)")
         }
         return url
+    }
+
+    /// 创建一次网页端会话（官方前端在首次聊天前调用）。
+    /// 真实会话必须来自这个端点，而不是客户端随机 UUID。
+    func createSession() async throws -> String {
+        var request = URLRequest(url: try makeURL("/api/v0/chat_session/create"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyClientHeaders(&request)
+        if isLoggedIn {
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        }
+        request.httpBody = Data("{}".utf8)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+            throw UpstreamError.http(status: http.statusCode, body: String(decoding: data, as: UTF8.self))
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+            throw UpstreamError.badResponse("创建会话响应不是合法 JSON")
+        }
+        if let message = Self.errorMessage(in: json) {
+            throw UpstreamError.upstream(message)
+        }
+        guard let id = Self.chatSessionID(in: json) else {
+            throw UpstreamError.badResponse("创建会话响应里没有 chat_session.id")
+        }
+        return id
+    }
+
+    /// 从响应里递归找 `chat_session.id`。
+    static func chatSessionID(in json: Any) -> String? {
+        if let dict = json as? [String: Any] {
+            if let session = dict["chat_session"] as? [String: Any],
+               let id = session["id"] as? String, !id.isEmpty {
+                return id
+            }
+            for (_, value) in dict {
+                if let found = chatSessionID(in: value) { return found }
+            }
+        } else if let array = json as? [Any] {
+            for value in array {
+                if let found = chatSessionID(in: value) { return found }
+            }
+        }
+        return nil
     }
 
     // MARK: - 工作量证明
@@ -183,7 +253,8 @@ struct DeepSeekWebClient {
                                 options: Options,
                                 chatSessionID: String,
                                 parentMessageID: String?,
-                                powHeader: String) throws -> URLRequest {
+                                powHeader: String,
+                                hifHeaders: [String: String] = [:]) throws -> URLRequest {
         var request = URLRequest(url: try makeURL(Self.chatPath))
         request.httpMethod = "POST"
         request.timeoutInterval = 180
@@ -195,6 +266,9 @@ struct DeepSeekWebClient {
         }
         if !powHeader.isEmpty {
             request.setValue(powHeader, forHTTPHeaderField: "X-DS-PoW-Response")
+        }
+        for (name, value) in hifHeaders where !value.isEmpty {
+            request.setValue(value, forHTTPHeaderField: name)
         }
 
         var body: [String: Any] = [
