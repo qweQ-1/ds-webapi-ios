@@ -85,10 +85,10 @@ struct LoginWebView: UIViewRepresentable {
                     return
                 }
 
-                // 1) 挂钩拿到的 Authorization
+                // 1) 挂钩拿到的 Authorization（最可靠，一定是页面最终会用的真 token）
                 if let hooked = object["hookToken"] as? String,
                    !hooked.isEmpty,
-                   CredentialExtractor.looksLikeToken(hooked) {
+                   CredentialExtractor.plausiblyToken(hooked) {
                     self.didCaptureToken = true
                     self.timer?.invalidate()
                     self.parent.onToken(hooked)

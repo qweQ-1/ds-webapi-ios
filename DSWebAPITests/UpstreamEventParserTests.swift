@@ -64,4 +64,45 @@ final class UpstreamEventParserTests: XCTestCase {
             XCTFail("应该是 unknown")
         }
     }
+
+    // MARK: - 最新官方 path/op 操作符格式
+
+    func testParsesOfficialAppendContentOp() {
+        let result = deltas("{\"p\":\"response/fragments/-1/content\",\"o\":\"APPEND\",\"v\":\"，\"}")
+        XCTAssertEqual(result, [.content("，")])
+    }
+
+    func testParsesOfficialContentOpWithoutOpDefaultsToSet() {
+        let result = deltas("{\"p\":\"response/fragments/-1/content\",\"v\":\"你好\"}")
+        XCTAssertEqual(result, [.content("你好")])
+    }
+
+    func testParsesOfficialThinkingFragmentOp() {
+        let result = deltas("{\"p\":\"response/fragments/0/content\",\"v\":\"思考中\",\"o\":\"APPEND\",\"f\":\"THINK\"}")
+        XCTAssertEqual(result.count, 1)
+        // THINK 由 path 或 f 字段识别
+        if case .thinking = result.first! {} else {
+            XCTFail("应该是思考内容")
+        }
+    }
+
+    func testParsesOfficialSnapshotWithFragments() {
+        let result = deltas("{\"v\":{\"response\":{\"message_id\":2,\"fragments\":[{\"type\":\"RESPONSE\",\"content\":\"快照正文\",\"status\":\"WIP\"}]}}}")
+        XCTAssertEqual(result, [.content("快照正文")])
+    }
+
+    func testParsesOfficialBatchOp() {
+        let result = deltas("{\"p\":\"response\",\"o\":\"BATCH\",\"v\":[{\"p\":\"fragments/-1/content\",\"v\":\"第一段\",\"o\":\"APPEND\"},{\"p\":\"quasi_status\",\"v\":\"FINISHED\"}]}")
+        XCTAssertTrue(result.contains(.content("第一段")))
+    }
+
+    func testParsesOfficialFinishedStatus() {
+        let result = deltas("{\"p\":\"response/status\",\"o\":\"SET\",\"v\":\"FINISHED\"}")
+        XCTAssertEqual(result, [.finish("stop")])
+    }
+
+    func testIgnoresNonContentPathOps() {
+        let result = deltas("{\"p\":\"response/fragments/-1/elapsed_secs\",\"o\":\"SET\",\"v\":0.95}")
+        XCTAssertTrue(result.isEmpty)
+    }
 }

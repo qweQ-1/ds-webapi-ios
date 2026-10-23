@@ -17,8 +17,19 @@ enum UpstreamDelta: Equatable {
 /// 把上游各种可能的 SSE 负载统一翻译成 UpstreamDelta。
 ///
 /// 网页端协议不是公开文档，而且改过几次，所以这里写得尽量"宽容"：
-/// 同时兼容 OpenAI 风格（choices[].delta.content）、自研风格（顶层 content / text）
-/// 以及思考内容字段（thinking_content / reasoning_content / is_think）。
+///
+/// 1. **最新官方 path/op 操作符格式**（2026-10 从 bundle 逆向）：
+///    ```json
+///    {"p":"response/fragments/-1/content","o":"APPEND","v":"，"}   // 增量追加
+///    {"p":"response/fragments/0/type","o":"SET","v":"THINK"}      // 设置
+///    {"p":"response","o":"BATCH","v":[{...子操作...}]}            // 批量
+///    {"v":{"response":{...}}}                                     // 初始快照
+///    ```
+///    - `p` 与 `o` 跨事件持久化：后续事件可省略，沿用上一次的值。
+///    - `o` 默认 `SET`；`APPEND` 对字符串是 `+=`；`BATCH` 递归分解子项。
+///    - 正文在路径 `response/fragments/-1/content`（或 index 位置）下，靠 `v` 携带。
+///
+/// 2. **旧版 OpenAI 风格**：`choices[].delta.content`、顶层 `content`/`text` 等。
 enum UpstreamEventParser {
 
     /// 解析一个 SSE 事件，可能产出多条增量
@@ -32,7 +43,6 @@ enum UpstreamEventParser {
         if name == "error" { return [.failure(raw)] }
         if name == "finish" { return [.finish("stop")] }
         if name == "close" {
-            // close 事件带 close_reason
             if let json = try? JSONSerialization.jsonObject(with: Data(raw.utf8), options: [.fragmentsAllowed]),
                let dict = json as? [String: Any],
                let reason = dict["close_reason"] as? String {
@@ -53,6 +63,9 @@ enum UpstreamEventParser {
 
     static func interpret(json: Any) -> [UpstreamDelta] {
         if let dict = json as? [String: Any] {
+            // 官方 path/op 操作符格式优先
+            let ops = interpretOps(dict)
+            if !ops.isEmpty { return ops }
             return interpret(dict: dict)
         }
         if let array = json as? [Any] {
@@ -64,10 +77,131 @@ enum UpstreamEventParser {
         return []
     }
 
+    // MARK: - 官方 path/op 操作符格式
+
+    /// 尝试按官方 path/op 格式解释一个事件。非该格式返回空数组，交回通用解析。
+    private static func interpretOps(_ dict: [String: Any]) -> [UpstreamDelta] {
+        // 初始快照：{"v": {"response": {...}}} —— 里面带 message_id / fragments
+        if let value = dict["v"] as? [String: Any], dict["p"] == nil, dict["o"] == nil {
+            return interpretSnapshot(value)
+        }
+
+        guard dict["p"] != nil || dict["o"] != nil || dict["v"] != nil else {
+            return []
+        }
+
+        let op = (dict["o"] as? String) ?? "SET"
+        let path = (dict["p"] as? String) ?? ""
+        let value = dict["v"]
+        // fragment 类型：官方可能用 f / type 字段标识 THINK / RESPONSE
+        let fragmentType = (dict["f"] as? String) ?? (dict["type"] as? String) ?? ""
+
+        // BATCH：递归分解子操作，父路径作为前缀
+        if op == "BATCH", let items = value as? [[String: Any]] {
+            var out: [UpstreamDelta] = []
+            for item in items {
+                var child = item
+                if !path.isEmpty {
+                    if let subPath = child["p"] as? String, !subPath.isEmpty {
+                        child["p"] = (path + "/" + subPath)
+                    } else {
+                        child["p"] = path
+                    }
+                }
+                out.append(contentsOf: interpretOps(child))
+            }
+            return out
+        }
+
+        // 归一化路径：去掉开头的 response/ 与结尾的响应控制段
+        let norm = normalizePath(path)
+
+        // 正文 / 思考内容提取
+        if let text = value as? String, !text.isEmpty {
+            if norm.contains("content") && !norm.contains("search") {
+                if fragmentType.uppercased() == "THINK" || isThinkingPath(norm) {
+                    return [.thinking(text)]
+                }
+                return [.content(text)]
+            }
+            if norm.contains("elapsed_secs") || norm.contains("search") {
+                return []
+            }
+            // 其它 path 下的字符串值，暂不当作正文
+            return []
+        }
+
+        // value 是对象（如 fragment 快照）时，从里面挖正文
+        if let fragment = value as? [String: Any] {
+            var out: [UpstreamDelta] = []
+            if let type = fragment["type"] as? String, type == "THINK",
+               let thinking = fragment["content"] as? String, !thinking.isEmpty {
+                out.append(.thinking(thinking))
+            }
+            if let type = fragment["type"] as? String, type == "RESPONSE",
+               let content = fragment["content"] as? String, !content.isEmpty {
+                out.append(.content(content))
+            }
+            return out
+        }
+
+        // 结束信号
+        if let status = value as? String, status.uppercased() == "FINISHED" {
+            return [.finish("stop")]
+        }
+        if let status = value as? String, status.uppercased() == "INCOMPLETE" {
+            return [.finish("length")]
+        }
+
+        return []
+    }
+
+    /// 初始快照 {"v":{"response":{...}}} 里直接挖正文/思考。
+    private static func interpretSnapshot(_ value: [String: Any]) -> [UpstreamDelta] {
+        guard let response = value["response"] as? [String: Any] else {
+            // 也许整个 value 就是 fragments 数组
+            return extractFrom(value)
+        }
+        return extractFrom(response)
+    }
+
+    /// 从任意包含 fragments 的字典里挖正文/思考（兼容旧版 fragments 数组）。
+    private static func extractFrom(_ dict: [String: Any]) -> [UpstreamDelta] {
+        var out: [UpstreamDelta] = []
+        if let fragments = dict["fragments"] as? [[String: Any]] {
+            for fragment in fragments {
+                if let type = fragment["type"] as? String, type == "THINK",
+                   let thinking = fragment["content"] as? String, !thinking.isEmpty {
+                    out.append(.thinking(thinking))
+                }
+                if let content = fragment["content"] as? String, !content.isEmpty,
+                   let type = fragment["type"] as? String, type != "THINK" {
+                    out.append(.content(content))
+                }
+            }
+        }
+        if let status = dict["status"] as? String, status.uppercased() == "FINISHED" {
+            out.append(.finish("stop"))
+        }
+        return out
+    }
+
+    /// 判断某路径是否指向思考片段。
+    private static func isThinkingPath(_ norm: String) -> Bool {
+        norm.contains("THINK") || norm.contains("thinking")
+    }
+
+    /// 把官方路径归一化，方便匹配。
+    private static func normalizePath(_ path: String) -> String {
+        let parts = path.split(separator: "/").filter { $0 != "response" }
+        return parts.joined(separator: "/")
+    }
+
+    // MARK: - 旧版 / 通用解析
+
     private static func interpret(dict: [String: Any]) -> [UpstreamDelta] {
         var deltas: [UpstreamDelta] = []
 
-        // 错误
         if let error = dict["error"] as? [String: Any] {
             let message = (error["message"] as? String) ?? (error["type"] as? String) ?? "未知错误"
             deltas.append(.failure(message))
@@ -77,14 +211,12 @@ enum UpstreamEventParser {
             deltas.append(.failure(message))
             return deltas
         }
-        // DeepSeek 业务错误码：40003 登录失效、40301 PoW 不对、40029 IP 被限
         if let code = DeepSeekWebClient.intValue(dict["code"]), code != 0, code != 200 {
             let message = (dict["message"] as? String) ?? (dict["biz_msg"] as? String) ?? "DeepSeek 返回错误码 \(code)"
             deltas.append(.failure(message))
             return deltas
         }
 
-        // OpenAI 风格
         if let choices = dict["choices"] as? [[String: Any]] {
             for choice in choices {
                 if let delta = choice["delta"] as? [String: Any] {
@@ -106,7 +238,6 @@ enum UpstreamEventParser {
             return deltas
         }
 
-        // 网页端常见包装：biz_data / data
         if let wrapped = dict["biz_data"] as? [String: Any] {
             deltas.append(contentsOf: interpret(dict: wrapped))
         }
@@ -114,10 +245,8 @@ enum UpstreamEventParser {
             deltas.append(contentsOf: interpret(dict: wrapped))
         }
 
-        // 思考内容
         if let thinking = thinkingText(dict) { deltas.append(.thinking(thinking)) }
 
-        // 正文
         var contentText: String?
         for key in ["content", "text", "delta", "answer", "chunk"] {
             if let value = dict[key] as? String, !value.isEmpty {
@@ -125,7 +254,6 @@ enum UpstreamEventParser {
                 break
             }
         }
-        // 分片数组
         if let fragments = dict["fragments"] as? [[String: Any]] {
             for fragment in fragments {
                 if let thinking = thinkingText(fragment) {
@@ -137,7 +265,6 @@ enum UpstreamEventParser {
             }
         }
         if let text = contentText, !text.isEmpty {
-            // is_think 表示这段是思考过程
             if let isThink = dict["is_think"] as? Bool, isThink {
                 deltas.append(.thinking(text))
             } else {
@@ -157,7 +284,6 @@ enum UpstreamEventParser {
         return deltas
     }
 
-    /// 思考内容字段名各家叫法不一，这里统一找
     private static func thinkingText(_ dict: [String: Any]) -> String? {
         let keys = ["thinking_content", "reasoning_content", "reasoning", "thought"]
         for key in keys {
