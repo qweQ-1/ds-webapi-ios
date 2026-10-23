@@ -13,6 +13,23 @@ final class CredentialExtractorTests: XCTestCase {
         XCTAssertEqual(CredentialExtractor.findToken(in: storage), "nested-token-value")
     }
 
+    func testFindsTokenInsideOfficialEnvelope() {
+        // 官方 storage 处理类把 userToken 写成 { "value": <token>, "__version": ... }
+        let storage = ["userToken": "{\"value\":\"opaque-token-value-1234567890\",\"__version\":\"0\"}"]
+        XCTAssertEqual(CredentialExtractor.findToken(in: storage), "opaque-token-value-1234567890")
+    }
+
+    func testFindsJWTTInsideOfficialEnvelope() {
+        let storage = ["userToken": "{\"value\":\"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc\",\"__version\":\"2\"}"]
+        XCTAssertEqual(CredentialExtractor.findToken(in: storage), "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc")
+    }
+
+    func testIgnoresNonTokenWrappedValue() {
+        // value 是用户 id 之类不叫 token 的字段，不应被当成凭证
+        let storage = ["someKey": "{\"value\":\"user-123\",\"__version\":\"0\"}"]
+        XCTAssertNil(CredentialExtractor.findToken(in: storage))
+    }
+
     func testFindsPlainTokenValue() {
         let storage = ["access_token": "plain-token-value-1234567890"]
         XCTAssertEqual(CredentialExtractor.findToken(in: storage), "plain-token-value-1234567890")
