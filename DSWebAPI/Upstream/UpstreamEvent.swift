@@ -63,9 +63,11 @@ enum UpstreamEventParser {
 
     static func interpret(json: Any) -> [UpstreamDelta] {
         if let dict = json as? [String: Any] {
-            // 官方 path/op 操作符格式优先
-            let ops = interpretOps(dict)
-            if !ops.isEmpty { return ops }
+            // 官方 path/op 操作符格式：带 p / o / v 键（或纯 v 快照）的事件，
+            // 一律只走 op 解析，不再回退通用解析，避免把控制负载误判成 unknown。
+            if isOpsShape(dict) {
+                return interpretOps(dict)
+            }
             return interpret(dict: dict)
         }
         if let array = json as? [Any] {
@@ -78,6 +80,17 @@ enum UpstreamEventParser {
     }
 
     // MARK: - 官方 path/op 操作符格式
+
+    /// 判断一个事件是否是官方 path/op 格式（带 p/o/v，或纯 v 快照）。
+    private static func isOpsShape(_ dict: [String: Any]) -> Bool {
+        if dict["p"] != nil || dict["o"] != nil { return true }
+        if let value = dict["v"] {
+            // 纯 v 快照：{"v":{"response":...}} 或 {"v":[...]} 是 ops 格式；
+            // 单独的 {"v":0.95} 等也按 ops 处理（返回空即可）。
+            return true
+        }
+        return false
+    }
 
     /// 尝试按官方 path/op 格式解释一个事件。非该格式返回空数组，交回通用解析。
     private static func interpretOps(_ dict: [String: Any]) -> [UpstreamDelta] {
@@ -116,6 +129,13 @@ enum UpstreamEventParser {
         // 归一化路径：去掉开头的 response/ 与结尾的响应控制段
         let norm = normalizePath(path)
 
+        // 结束信号（优先判断：status / quasi_status 的 FINISHED/INCOMPLETE）
+        if let status = value as? String {
+            let upper = status.uppercased()
+            if upper == "FINISHED" { return [.finish("stop")] }
+            if upper == "INCOMPLETE" { return [.finish("length")] }
+        }
+
         // 正文 / 思考内容提取
         if let text = value as? String, !text.isEmpty {
             if norm.contains("content") && !norm.contains("search") {
@@ -143,14 +163,6 @@ enum UpstreamEventParser {
                 out.append(.content(content))
             }
             return out
-        }
-
-        // 结束信号
-        if let status = value as? String, status.uppercased() == "FINISHED" {
-            return [.finish("stop")]
-        }
-        if let status = value as? String, status.uppercased() == "INCOMPLETE" {
-            return [.finish("length")]
         }
 
         return []
