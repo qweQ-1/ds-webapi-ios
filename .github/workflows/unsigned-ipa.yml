@@ -53,7 +53,7 @@ jobs:
             -archivePath build/DSWebAPI.xcarchive \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' \
             CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
-            2>&1 | tail -30
+            2>&1 | tail -400
 
       - name: Package unsigned IPA
         shell: bash
