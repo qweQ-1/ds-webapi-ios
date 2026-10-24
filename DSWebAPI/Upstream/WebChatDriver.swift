@@ -311,7 +311,6 @@ final class WebChatDriver: NSObject, ObservableObject {
     // MARK: - WKWebView
 
     @discardableResult
-    @MainActor
     private func makeWebViewIfNeeded() -> WKWebView {
         if let webView { return webView }
 
@@ -345,13 +344,13 @@ final class WebChatDriver: NSObject, ObservableObject {
     /// 所以「网页」页一出现就把它挂进去，之后切换标签也不会把它摘下来。
     @discardableResult
     func attachTo(container: UIView) -> WKWebView {
+        // WebKit 只能在主线程用，这里自己保证一定在主线程执行
         if Thread.isMainThread {
             return attachOnMain(to: container)
         }
         return DispatchQueue.main.sync { attachOnMain(to: container) }
     }
 
-    @MainActor
     private func attachOnMain(to container: UIView) -> WKWebView {
         let view = makeWebViewIfNeeded()
         if view.superview !== container {
@@ -365,7 +364,6 @@ final class WebChatDriver: NSObject, ObservableObject {
 
     /// 把网页挂到窗口外面（屏幕外），这样即使当前不在「网页」页，
     /// 它也在后台正常加载、执行 JS，API 才随时能用。
-    @MainActor
     private func attachToWindow(_ view: WKWebView) {
         DispatchQueue.main.async {
             guard view.superview == nil else { return }
