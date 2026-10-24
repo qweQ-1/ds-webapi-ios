@@ -125,7 +125,7 @@ final class WebChatDriver: NSObject, ObservableObject {
     /// 确保网页端已经加载好（没加载就加载，等它 load 完）
     @MainActor
     func ensureLoaded() async throws {
-        if let webView, didFinishLoad {
+        if webView != nil, didFinishLoad {
             await refreshStatus()
             return
         }
@@ -343,7 +343,7 @@ final class WebChatDriver: NSObject, ObservableObject {
     /// 把网页挂到界面上。网页第一次进入视图树时才会有真实 viewport，
     /// 所以「网页」页一出现就把它挂进去，之后切换标签也不会把它摘下来。
     @discardableResult
-    func attachTo(container: UIView) -> WKWebView {
+    func attachTo(_ container: UIView) -> WKWebView {
         // WebKit 只能在主线程用，这里自己保证一定在主线程执行
         if Thread.isMainThread {
             return attachOnMain(to: container)

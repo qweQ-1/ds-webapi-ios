@@ -22,7 +22,7 @@ struct WebChatView: View {
             WebChatContainer()
         }
         .task {
-            await driver.ensureLoaded()
+            try? await driver.ensureLoaded()
             await driver.refreshStatus()
             // 页面里登录 / 登出都会改登录态，这里定期同步一下状态显示
             while !Task.isCancelled {
