@@ -1,10 +1,16 @@
 # 自定义工作流（不在 ios-ci-workflows 标准四级内）：
 # 打一个不签名的 IPA，供 AltStore / Sideloadly / 轻松签 等工具用免费 Apple ID 自签安装。
-# 触发：手动运行（Actions → Unsigned IPA → Run workflow）。
+# 触发：
+# - 手动运行（Actions → Unsigned IPA → Run workflow）
+# - 推送到 main 自动运行（当前 fine-grained token 无 Actions:write 权限，
+#   无法通过 API 触发 workflow_dispatch，故补上 push 触发器，免去手动点按钮）
 name: Unsigned IPA
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
