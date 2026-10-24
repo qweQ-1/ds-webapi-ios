@@ -297,6 +297,17 @@ final class BridgeServer {
         let guest = !client.isLoggedIn
         let envelope = OpenAIEnvelope(model: options.modelType)
 
+        // 网页驱动模式：直接让真实网页发消息，把它的回复原样转成 API。
+        if settingsProvider().useWebDriver {
+            await webDrivenCompletion(prompt: prompt,
+                                      options: options,
+                                      wantsStream: wantsStream,
+                                      conversationKey: conversationKey,
+                                      envelope: envelope,
+                                      writer: writer)
+            return
+        }
+
         do {
             // HIF 令牌与 PoW 并行准备，减少首轮延迟。
             async let hifHeaders = hifTokens.headers(baseHeaders: client.clientHeaderFields)
@@ -362,6 +373,91 @@ final class BridgeServer {
                 writer.write(OpenAIEnvelope.error(error.localizedDescription, code: "upstream_error"))
             }
             writer.close()
+        }
+    }
+
+    /// 网页驱动模式：让真实的 DeepSeek 网页自己发消息，我们把它的回复转成 API。
+    ///
+    /// 和「直连接口」模式的区别：这里不自己拼请求、不自己算 PoW、不自己带风控令牌，
+    /// 全都由网页端自己完成 —— 我们只是在页面里打字、点发送，然后截获它发出的 SSE。
+    @MainActor
+    private func webDrivenCompletion(prompt: String,
+                                     options: DeepSeekWebClient.Options,
+                                     wantsStream: Bool,
+                                     conversationKey: String,
+                                     envelope: OpenAIEnvelope,
+                                     writer: HTTPResponseWriter) async {
+        let driver = WebChatDriver.shared
+        logger(.info, "网页驱动模式：\(options.modelType)")
+
+        // 换 OpenAI 会话时，网页端也另起一段新对话
+        if driver.currentConversation != conversationKey {
+            do {
+                try await driver.ensureLoaded()
+                await driver.startNewConversation()
+                driver.setConversation(conversationKey)
+            } catch {
+                logger(.warn, "切换网页端会话失败：\(error.localizedDescription)")
+            }
+        }
+
+        if wantsStream {
+            writer.sendHead(status: 200, contentType: "text/event-stream; charset=utf-8")
+            var isFirst = true
+            var finishReason = "stop"
+            var fullText = ""
+            var thinkingText = ""
+            do {
+                for try await delta in driver.send(prompt: prompt) {
+                    switch delta {
+                    case let .content(text):
+                        fullText += text
+                        var payload: [String: Any] = ["content": text]
+                        if isFirst {
+                            payload["role"] = "assistant"
+                            isFirst = false
+                        }
+                        writer.write("data: \(envelope.chunk(delta: payload, finishReason: nil))\n\n")
+                    case let .thinking(text):
+                        thinkingText += text
+                        writer.write("data: \(envelope.chunk(delta: ["reasoning_content": text], finishReason: nil))\n\n")
+                    case let .finish(reason):
+                        finishReason = reason ?? "stop"
+                    case let .failure(message):
+                        writer.write("data: \(OpenAIEnvelope.error(message))\n\n")
+                    case .unknown:
+                        break
+                    }
+                }
+            } catch {
+                logger(.error, "网页驱动失败：\(error.localizedDescription)")
+                writer.write("data: \(OpenAIEnvelope.error(error.localizedDescription, code: "upstream_error"))\n\n")
+            }
+            writer.write("data: \(envelope.chunk(delta: [:], finishReason: finishReason))\n\n")
+            writer.write("data: [DONE]\n\n")
+            writer.close()
+            logger(.ok, "网页端回复完成，正文 \(fullText.count) 字，思考 \(thinkingText.count) 字")
+        } else {
+            var content = ""
+            var thinking = ""
+            var finishReason = "stop"
+            do {
+                for try await delta in driver.send(prompt: prompt) {
+                    switch delta {
+                    case let .content(text): content += text
+                    case let .thinking(text): thinking += text
+                    case let .finish(reason): finishReason = reason ?? "stop"
+                    default: break
+                    }
+                }
+                writer.sendHead(status: 200)
+                writer.write(envelope.completion(content: content, thinking: thinking, finishReason: finishReason))
+            } catch {
+                writer.sendHead(status: 502)
+                writer.write(OpenAIEnvelope.error(error.localizedDescription, code: "upstream_error"))
+            }
+            writer.close()
+            logger(.ok, "网页端非流式回复完成，正文 \(content.count) 字")
         }
     }
 

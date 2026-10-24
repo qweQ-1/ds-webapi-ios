@@ -13,6 +13,9 @@ struct AppSettings: Codable, Equatable {
     var searchEnabled: Bool = false
     /// 用官方 /chat_session/create 建立真实网页端会话（而非本地随机 UUID）
     var useServerSession: Bool = false
+    /// 网页驱动模式：让 App 内嵌的真实网页去发消息，把它的回复转成 API。
+    /// 官方内部接口改动频繁（PoW、风控令牌、事件格式），走网页最稳。
+    var useWebDriver: Bool = true
     /// 每次请求都带上这段系统提示词
     var systemPrompt: String = ""
     var temperature: Double = 0.7

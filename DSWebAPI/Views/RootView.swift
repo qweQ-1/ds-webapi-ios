@@ -3,15 +3,22 @@ import UIKit
 
 struct RootView: View {
     @EnvironmentObject private var store: AppStore
+    @State private var selection = 2
 
     var body: some View {
-        TabView {
+        TabView(selection: $selection) {
             ChatView()
                 .tabItem { Label("聊天", systemImage: "bubble.left.and.bubble.right") }
+                .tag(0)
             ApiView()
                 .tabItem { Label("接口", systemImage: "point.3.connected.trianglepath.dotted") }
+                .tag(1)
+            WebChatView()
+                .tabItem { Label("网页", systemImage: "globe") }
+                .tag(2)
             SettingsView()
                 .tabItem { Label("设置", systemImage: "gearshape") }
+                .tag(3)
         }
         .onAppear {
             store.refreshCredentialState()

@@ -11,6 +11,18 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
+                    Toggle("网页驱动模式（推荐）", isOn: $store.settings.useWebDriver)
+                        .onChange(of: store.settings.useWebDriver) { _ in store.settings.save() }
+                    Text(store.settings.useWebDriver
+                         ? "API 请求交给「网页」页里的真实 DeepSeek 网页去发，我们只负责把它的回复转成 API。PoW、风控令牌、登录态都由官方网页自己处理，官方改内部协议也不影响。"
+                         : "直连 DeepSeek 内部接口：自己算 PoW、自己带风控令牌。官方接口一改就容易失效，建议保持网页驱动模式。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("工作模式")
+                }
+
+                Section {
                     HStack {
                         Image(systemName: store.tokenPresent ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
                             .foregroundStyle(store.tokenPresent ? Color.green : Color.orange)
